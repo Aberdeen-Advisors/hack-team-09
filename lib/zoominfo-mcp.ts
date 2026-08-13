@@ -410,20 +410,29 @@ function normalizeDomain(value: string): string {
   catch { return value.replace(/^www\./, "").replace(/\/$/, "").toLowerCase(); }
 }
 
-function recordDomain(record: UnknownRecord): string | undefined {
+// A company can publish several domains and ZoomInfo may order them arbitrarily, so
+// every one it returns has to be considered. Matching stays exact: this widens which
+// domains are compared, never how loosely they are compared.
+export function recordDomains(record: UnknownRecord): string[] {
   const direct = stringValue(record, ["website", "companyWebsite", "domain", "url"]);
-  if (direct) return normalizeDomain(direct);
-  const domains = record.domainList;
-  if (Array.isArray(domains) && typeof domains[0] === "string") return normalizeDomain(domains[0]);
-  return undefined;
+  const listed = Array.isArray(record.domainList) ? record.domainList.filter((value): value is string => typeof value === "string") : [];
+  return [...new Set([...(direct ? [direct] : []), ...listed].map(normalizeDomain))];
 }
 
 async function resolveCompany(client: Client, account: Account): Promise<{ companyId: string; record: UnknownRecord }> {
   const payload = await callTool(client, "search_companies", { companyWebsite: account.website, pageSize: 10, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
   const records = findRecords(payload, ["companies", "results", "data", "records"]);
   const expectedDomain = normalizeDomain(account.website);
-  const matches = records.filter((record) => recordDomain(record) === expectedDomain);
-  if (matches.length !== 1) throw new Error(matches.length ? `ZoomInfo returned multiple exact domain matches for ${expectedDomain}` : `No exact ZoomInfo domain match for ${expectedDomain}`);
+  const matches = records.filter((record) => recordDomains(record).includes(expectedDomain));
+  if (matches.length !== 1) {
+    // Without the domains ZoomInfo actually returned there is no way to tell an empty
+    // result apart from a response this code failed to parse.
+    const observed = [...new Set(records.flatMap(recordDomains))].slice(0, 5);
+    const seen = records.length === 0
+      ? "the search returned no readable records"
+      : `the search returned ${records.length} record(s) with domains ${observed.length ? observed.join(", ") : "that could not be read"}`;
+    throw new Error(matches.length ? `ZoomInfo returned ${matches.length} exact domain matches for ${expectedDomain}` : `No exact ZoomInfo domain match for ${expectedDomain}; ${seen}`);
+  }
   const companyId = stringValue(matches[0], ["companyId", "zoominfoCompanyId", "ziCompanyId", "id"]);
   if (!companyId) throw new Error(`ZoomInfo company match for ${account.name} did not include a company ID`);
   return { companyId, record: matches[0] };
@@ -659,7 +668,12 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
       });
     }
     if (!updates.length) {
-      const message = failures[0]?.message || "ZoomInfo refresh returned no usable account data";
+      // Naming a single account read as one company's problem when in fact every
+      // candidate failed, which pointed debugging at the wrong thing.
+      const distinct = [...new Set(failures.map((failure) => failure.message))];
+      const message = failures.length
+        ? `All ${failures.length} ZoomInfo accounts failed to refresh. ${distinct.slice(0, 3).join(" | ")}${distinct.length > 3 ? ` | and ${distinct.length - 3} more` : ""}`
+        : "ZoomInfo refresh returned no usable account data";
       await persistence.updateZoomInfoMeta({ error: message });
       throw new Error(message);
     }

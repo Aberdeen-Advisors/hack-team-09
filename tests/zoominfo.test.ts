@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appPersistence, resetPersistenceForTests } from "@/lib/persistence";
 import { applyZoomInfoUpdates, getSessionAccounts, resetSessionAccountsForTests } from "@/lib/session-store";
-import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, resetZoomInfoStateForTests } from "@/lib/zoominfo-mcp";
+import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, recordDomains, resetZoomInfoStateForTests } from "@/lib/zoominfo-mcp";
 
 describe("ZoomInfo MCP normalization", () => {
   beforeEach(() => {
@@ -21,6 +21,12 @@ describe("ZoomInfo MCP normalization", () => {
     expect(signal.id).toBe("scoop-1");
     expect(signal.source.provenance).toBe("verified");
     expect(signal.source.label).toBe("ZoomInfo licensed signal");
+  });
+
+  it("reads every domain a company publishes, not just the first", () => {
+    expect(recordDomains({ domainList: ["vacationclub.com", "marriottvacationsworldwide.com"] })).toContain("marriottvacationsworldwide.com");
+    expect(recordDomains({ companyWebsite: "https://www.MarriottVacationsWorldwide.com/" })).toEqual(["marriottvacationsworldwide.com"]);
+    expect(recordDomains({})).toEqual([]);
   });
 
   it("still produces a scoop signal when intent topics could not be resolved", () => {
