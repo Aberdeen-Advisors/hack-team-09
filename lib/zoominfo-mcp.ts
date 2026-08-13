@@ -9,10 +9,10 @@ import {
   type StoredOAuthClientInformation,
   type StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
-import { accountSchema, buyerSchema, signalSchema, type Account, type Buyer, type Signal } from "@/lib/schemas";
+import { accountSchema, buyerSchema, firmographicsSchema, signalSchema, type Account, type Buyer, type Firmographics, type Signal } from "@/lib/schemas";
 import { appPersistence, redisConfigured, resetPersistenceForTests, type AppPersistence, type PendingOAuth } from "@/lib/persistence";
 import { scoreAccount } from "@/lib/scoring";
-import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate } from "@/lib/session-store";
+import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate, type ZoomInfoCompanyProfile } from "@/lib/session-store";
 import { decryptOAuthTokens, encryptOAuthTokens, tokenEncryptionConfigured } from "@/lib/token-crypto";
 
 const REQUIRED_TOOLS = ["lookup", "search_companies", "enrich_intent", "enrich_scoops", "get_recommended_contacts", "search_contacts"] as const;
@@ -491,9 +491,16 @@ function stringValue(record: UnknownRecord, keys: string[]): string | undefined 
   return undefined;
 }
 
+// Number(null), Number("") and Number([]) are all 0, so coercing blindly turns a field
+// ZoomInfo simply did not populate into a confident zero. For revenue that meant a real
+// company scoring as "Under $50M" against the ICP band, so only genuine numerics count.
 function numberValue(record: UnknownRecord, keys: string[]): number | undefined {
   for (const key of keys) {
-    const value = Number(record[key]);
+    const raw = record[key];
+    if (typeof raw === "number") { if (Number.isFinite(raw)) return raw; continue; }
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    // ZoomInfo formats some numerics as "5,500" or "$4.8B"-style text; strip grouping only.
+    const value = Number(raw.replace(/,/g, "").trim());
     if (Number.isFinite(value)) return value;
   }
   return undefined;
@@ -529,6 +536,65 @@ export function recordDomains(record: UnknownRecord): string[] {
   const direct = stringValue(record, ["website", "companyWebsite", "domain", "url"]);
   const listed = Array.isArray(record.domainList) ? record.domainList.filter((value): value is string => typeof value === "string") : [];
   return [...new Set([...(direct ? [direct] : []), ...listed].map(normalizeDomain))];
+}
+
+// ZoomInfo reports annual revenue in thousands of USD on the numeric field and a bucket
+// string on the range field. Only the numeric field can be compared against the ICP band,
+// so the unit conversion is stated here rather than assumed at the scoring call site.
+// No public company earns $10T, so a result above that means the unit assumption did not
+// hold for this record. Scoring a fabricated number would be worse than scoring none, so
+// the figure is dropped and the account keeps its existing, clearly-labelled revenue.
+const MAX_PLAUSIBLE_REVENUE_MILLIONS = 10_000_000;
+
+export function revenueMillionsFromRecord(record: UnknownRecord): number | null {
+  const explicitMillions = numberValue(record, ["revenueMillions", "annualRevenueMillions"]);
+  const thousands = numberValue(record, ["revenue", "annualRevenue"]);
+  const millions = explicitMillions ?? (thousands === undefined ? undefined : thousands / 1000);
+  if (millions === undefined || millions < 0 || millions > MAX_PLAUSIBLE_REVENUE_MILLIONS) return null;
+  return millions;
+}
+
+export function formatRevenueBand(millions: number | null): string | undefined {
+  if (millions === null) return undefined;
+  if (millions >= 100_000) return "$100B+";
+  if (millions >= 50_000) return "$50B+";
+  if (millions >= 20_000) return "$20B+";
+  if (millions >= 10_000) return "$10B-$20B";
+  if (millions >= 5_000) return "$5B-$10B";
+  if (millions >= 1_000) return "$1B-$5B";
+  if (millions >= 50) return "$50M-$1B";
+  return "Under $50M";
+}
+
+// sourceReference.url must parse as a URL. ZoomInfo returns websites as bare hostnames as
+// often as full URLs, and letting one through unchecked would fail the schema and take the
+// whole account's refresh down over a display-only field.
+function absoluteUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try { return new URL(value.includes("://") ? value : `https://${value}`).toString(); }
+  catch { return undefined; }
+}
+
+// The company record was already paid for by the domain match, so the firmographics it
+// carries are read here instead of being discarded with the rest of the record.
+export function buildCompanyProfile(record: UnknownRecord, now = new Date()): ZoomInfoCompanyProfile {
+  const revenueMillions = revenueMillionsFromRecord(record);
+  const location = [stringValue(record, ["city"]), stringValue(record, ["state"]), stringValue(record, ["country"])].filter(Boolean).join(", ");
+  const firmographics: Firmographics = firmographicsSchema.parse({
+    employeeCount: numberValue(record, ["employeeCount", "employees", "numberOfEmployees"]) ?? null,
+    revenueMillions,
+    industry: stringValue(record, ["primaryIndustry", "industry", "sicIndustry", "naicsIndustry"]),
+    hqLocation: location || undefined,
+    companyType: stringValue(record, ["companyType", "businessModel", "ownershipType"]),
+    ticker: stringValue(record, ["ticker", "tickerSymbol"]),
+    foundedYear: numberValue(record, ["foundedYear", "yearFounded"]),
+    source: { label: "ZoomInfo company profile", url: absoluteUrl(stringValue(record, ["website", "companyWebsite"])), observedAt: now.toISOString(), provenance: "verified" },
+  });
+  return {
+    firmographics,
+    legalName: stringValue(record, ["companyName", "name", "legalName"]),
+    revenueRange: stringValue(record, ["revenueRange"]) || formatRevenueBand(revenueMillions),
+  };
 }
 
 async function resolveCompany(client: Client, account: Account): Promise<{ companyId: string; record: UnknownRecord }> {
@@ -593,7 +659,7 @@ async function resolveIntentTopics(client: Client): Promise<{ topics: string[]; 
   return { topics: [], note: `ZoomInfo lookup returned no intent topics for ${queries.join(", ")}, so signals came from Scoops only. Response contained: ${shape}.${lookupSchemaSummary ? ` Lookup accepts ${lookupSchemaSummary}.` : ""}` };
 }
 
-type SignalCandidate = { id: string; type: Signal["type"]; summary: string; url?: string; date: string; intentScore: number; relevantIntent: boolean; transformationEvidence: boolean; mergerOrAcquisition: boolean };
+type SignalCandidate = { id: string; type: Signal["type"]; summary: string; url?: string; date: string; intentScore: number; relevantIntent: boolean; transformationEvidence: boolean; mergerOrAcquisition: boolean; topic?: string; scoopType?: string };
 
 function validDate(record: UnknownRecord, keys: string[]): string | undefined {
   const value = stringValue(record, keys);
@@ -642,21 +708,54 @@ export function buildSignalFromToolResults(accountId: string, intentPayload: unk
     const score = numberValue(record, ["signalScore", "score"]) ?? 0;
     if (!topic || !date || score < 70 || Date.parse(date) < lookbackStart.getTime()) continue;
     const type = intentType(topic);
-    candidates.push({ id: stringValue(record, ["intentId", "id"]) || `${accountId}-intent-${topic}`, type, summary: `ZoomInfo intent activity for ${topic} (signal score ${score}).`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: score, relevantIntent: true, transformationEvidence: type !== "No current signal", mergerOrAcquisition: false });
+    candidates.push({ id: stringValue(record, ["intentId", "id"]) || `${accountId}-intent-${topic}`, type, summary: `ZoomInfo intent activity for ${topic} (signal score ${score}).`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: score, relevantIntent: true, transformationEvidence: type !== "No current signal", mergerOrAcquisition: false, topic });
   }
   for (const record of scoopRecords) {
     const rawType = stringValue(record, ["scoopType", "type", "category"]);
     const date = validDate(record, ["originalPublishedDate", "publishedDate", "date"]);
     const mappedType = rawType ? scoopType(rawType) : undefined;
     if (!rawType || !date || !mappedType || Date.parse(date) < lookbackStart.getTime()) continue;
-    candidates.push({ id: stringValue(record, ["scoopId", "id"]) || `${accountId}-scoop-${date}`, type: mappedType, summary: stringValue(record, ["description", "summary", "linkText"]) || `ZoomInfo ${rawType} scoop.`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: 0, relevantIntent: false, transformationEvidence: ["Transformation", "Technology modernization"].includes(mappedType), mergerOrAcquisition: mappedType === "M&A" });
+    candidates.push({ id: stringValue(record, ["scoopId", "id"]) || `${accountId}-scoop-${date}`, type: mappedType, summary: stringValue(record, ["description", "summary", "linkText"]) || `ZoomInfo ${rawType} scoop.`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: 0, relevantIntent: false, transformationEvidence: ["Transformation", "Technology modernization"].includes(mappedType), mergerOrAcquisition: mappedType === "M&A", scoopType: rawType });
   }
   candidates.sort((a, b) => Date.parse(b.date) - Date.parse(a.date) || b.intentScore - a.intentScore || a.id.localeCompare(b.id));
+  // Only one candidate becomes the headline, but the workspace scores and recommends against
+  // the whole observed picture, so every qualifying trigger is carried through as evidence.
+  // ZoomInfo can report the same topic on several dates. Deduplicating on the way in keeps
+  // the highest-scoring observation and stops the workspace repeating one topic as evidence.
+  // filter() copies first, so sorting here never disturbs the headline ordering below.
+  const byTopic = new Map<string, SignalCandidate>();
+  for (const candidate of candidates.filter((item) => item.topic).sort((a, b) => b.intentScore - a.intentScore)) {
+    if (!byTopic.has(candidate.topic!.toLowerCase())) byTopic.set(candidate.topic!.toLowerCase(), candidate);
+  }
+  const byScoop = new Map<string, SignalCandidate>();
+  for (const candidate of candidates.filter((item) => item.scoopType)) {
+    if (!byScoop.has(candidate.id)) byScoop.set(candidate.id, candidate);
+  }
+  const evidence = {
+    intentTopics: [...byTopic.values()].slice(0, 8).map((candidate) => ({ topic: candidate.topic!, score: candidate.intentScore, date: candidate.date })),
+    scoops: [...byScoop.values()].slice(0, 8).map((candidate) => ({ type: candidate.scoopType!, summary: candidate.summary, date: candidate.date, url: absoluteUrl(candidate.url) })),
+  };
   const selected = candidates[0];
   if (!selected) {
-    return signalSchema.parse({ id: `zoominfo-none-${accountId}-${now.toISOString().slice(0, 10)}`, accountId, type: "No current signal", summary: "No qualifying ZoomInfo intent or scoop was found in the configured lookback window.", whyNow: whyNow("No current signal"), source: { label: "ZoomInfo licensed signal", observedAt: now.toISOString(), provenance: "verified" }, date: now.toISOString().slice(0, 10), relevantIntent: false, activeWithin90Days: false, transformationEvidence: false, mergerOrAcquisition: false });
+    return signalSchema.parse({ id: `zoominfo-none-${accountId}-${now.toISOString().slice(0, 10)}`, accountId, type: "No current signal", summary: "No qualifying ZoomInfo intent or scoop was found in the configured lookback window.", whyNow: whyNow("No current signal"), source: { label: "ZoomInfo licensed signal", observedAt: now.toISOString(), provenance: "verified" }, date: now.toISOString().slice(0, 10), relevantIntent: false, activeWithin90Days: false, transformationEvidence: false, mergerOrAcquisition: false, evidence });
   }
-  return signalSchema.parse({ id: selected.id, accountId, type: selected.type, summary: selected.summary, whyNow: whyNow(selected.type), source: { label: "ZoomInfo licensed signal", url: selected.url, observedAt: now.toISOString(), provenance: "verified" }, date: selected.date, relevantIntent: selected.relevantIntent, activeWithin90Days: true, transformationEvidence: selected.transformationEvidence, mergerOrAcquisition: selected.mergerOrAcquisition });
+  // The scoring flags describe the account, not the headline. Reading them off the winning
+  // candidate alone meant an account with qualifying intent scored zero for intent whenever a
+  // scoop happened to be more recent, so they are answered from every observed trigger.
+  return signalSchema.parse({
+    id: selected.id,
+    accountId,
+    type: selected.type,
+    summary: selected.summary,
+    whyNow: whyNow(selected.type),
+    source: { label: "ZoomInfo licensed signal", url: absoluteUrl(selected.url), observedAt: now.toISOString(), provenance: "verified" },
+    date: selected.date,
+    relevantIntent: candidates.some((candidate) => candidate.relevantIntent),
+    activeWithin90Days: true,
+    transformationEvidence: candidates.some((candidate) => candidate.transformationEvidence),
+    mergerOrAcquisition: candidates.some((candidate) => candidate.mergerOrAcquisition),
+    evidence,
+  });
 }
 
 function decisionRoleForTitle(title: string): string {
@@ -671,7 +770,21 @@ export function normalizeBuyerFromContact(record: UnknownRecord, personId: strin
   const name = stringValue(record, ["fullName", "name"]) || [stringValue(record, ["firstName"]), stringValue(record, ["lastName"])].filter(Boolean).join(" ");
   const title = stringValue(record, ["jobTitle", "title"]);
   if (!name || !title) return undefined;
-  return buyerSchema.parse({ id: `zoominfo-person-${personId}`, name, title, decisionRole: decisionRoleForTitle(title), decisionRoleProvenance: "inferred", warmth: "Unknown", relationshipSource: "No known Aberdeen relationship; ZoomInfo recommendation only", relationshipProvenance: "unknown", suggestedPath: "Validate relevance and shared context before any outreach; do not treat the recommendation as a relationship.", source: { label: `ZoomInfo recommended contact #${rank}`, observedAt: now.toISOString(), provenance: "verified" } });
+  // Function, seniority, and department are the only non-identifying context ZoomInfo
+  // returns that changes how a buyer is approached; email and phone stay excluded.
+  const context = [stringValue(record, ["managementLevel", "seniority"]), stringValue(record, ["jobFunction", "department"]), stringValue(record, ["city", "location"])].filter(Boolean).join(" · ");
+  return buyerSchema.parse({
+    id: `zoominfo-person-${personId}`,
+    name,
+    title,
+    decisionRole: decisionRoleForTitle(title),
+    decisionRoleProvenance: "inferred",
+    warmth: "Unknown",
+    relationshipSource: "No known Aberdeen relationship; ZoomInfo recommendation only",
+    relationshipProvenance: "unknown",
+    suggestedPath: "Validate relevance and shared context before any outreach; do not treat the recommendation as a relationship.",
+    source: { label: context ? `ZoomInfo recommended contact #${rank} · ${context}` : `ZoomInfo recommended contact #${rank}`, observedAt: now.toISOString(), provenance: "verified" },
+  });
 }
 
 async function fetchBuyers(client: Client, companyId: string): Promise<Buyer[]> {
@@ -715,7 +828,7 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
   const intentPayload = intentResult.status === "fulfilled" ? intentResult.value : {};
   const scoopsPayload = scoopsResult.status === "fulfilled" ? scoopsResult.value : {};
   const buyers = buyersResult.status === "fulfilled" ? buyersResult.value : [];
-  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal: buildSignalFromToolResults(account.id, intentPayload, scoopsPayload), buyers };
+  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal: buildSignalFromToolResults(account.id, intentPayload, scoopsPayload), buyers, profile: buildCompanyProfile(company.record) };
 }
 
 function refreshCandidates(items: Account[]): Account[] {
@@ -725,8 +838,13 @@ function refreshCandidates(items: Account[]): Account[] {
   return [...representatives.values()].sort((a, b) => scoreAccount(b).total - scoreAccount(a).total || a.name.localeCompare(b.name)).slice(0, limit);
 }
 
+// Bump when a refresh starts capturing fields the cached payload does not carry, otherwise a
+// warm cache keeps serving the older, thinner shape until its TTL expires and the new data
+// never reaches the workspace. v2 added company firmographics and full signal evidence.
+const CACHE_SHAPE_VERSION = "v2";
+
 function cacheKey(account: Account, topics: string[]): string {
-  return `${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
+  return `${CACHE_SHAPE_VERSION}|${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
 }
 
 export type ZoomInfoRefreshSummary = {

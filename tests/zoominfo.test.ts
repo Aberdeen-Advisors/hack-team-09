@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appPersistence, resetPersistenceForTests } from "@/lib/persistence";
 import { applyZoomInfoUpdates, getSessionAccounts, resetSessionAccountsForTests } from "@/lib/session-store";
-import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, payloadPreview, recordDomains, resetZoomInfoStateForTests, zoomInfoInternalsForTests } from "@/lib/zoominfo-mcp";
+import { DurableZoomInfoOAuthProvider, buildCompanyProfile, buildSignalFromToolResults, credentialDiagnostics, formatRevenueBand, normalizeBuyerFromContact, payloadPreview, recordDomains, resetZoomInfoStateForTests, revenueMillionsFromRecord, zoomInfoInternalsForTests } from "@/lib/zoominfo-mcp";
 
 describe("ZoomInfo MCP normalization", () => {
   beforeEach(() => {
@@ -67,6 +67,47 @@ describe("ZoomInfo MCP normalization", () => {
     expect(buyer).not.toHaveProperty("phone");
   });
 
+  it("keeps every qualifying trigger as evidence, not just the headline", () => {
+    const signal = buildSignalFromToolResults(
+      "draftkings",
+      { intent: [{ topic: "Generative AI", signalScore: 92, signalDate: "2026-08-01" }, { topic: "Cloud Migration", signalScore: 78, signalDate: "2026-07-28" }] },
+      { scoops: [{ scoopId: "scoop-1", scoopType: "Funding", originalPublishedDate: "2026-08-05", description: "Announced a new growth investment.", link: "https://example.com/funding" }] },
+      new Date("2026-08-13T12:00:00.000Z"),
+    );
+
+    // The Funding scoop wins the headline, but the intent research still has to reach the
+    // prioritize and pursuit tabs instead of being discarded with the losing candidates.
+    expect(signal.type).toBe("Funding");
+    expect(signal.evidence.intentTopics.map((item) => item.topic)).toEqual(["Generative AI", "Cloud Migration"]);
+    expect(signal.evidence.intentTopics[0]).toMatchObject({ score: 92, date: "2026-08-01" });
+    expect(signal.evidence.scoops).toEqual([{ type: "Funding", summary: "Announced a new growth investment.", date: "2026-08-05", url: "https://example.com/funding" }]);
+    // The scoring flags describe the account, so qualifying intent still counts even though
+    // a scoop won the headline.
+    expect(signal.relevantIntent).toBe(true);
+  });
+
+  it("reads firmographics off the company record the domain match already paid for", () => {
+    const profile = buildCompanyProfile({ name: "DraftKings Inc.", revenue: 4_800_000, employeeCount: "5,500", primaryIndustry: "Gaming", city: "Boston", state: "MA", ticker: "DKNG", website: "draftkings.com" }, new Date("2026-08-13T12:00:00.000Z"));
+
+    expect(profile.legalName).toBe("DraftKings Inc.");
+    expect(profile.firmographics.revenueMillions).toBe(4800);
+    expect(profile.revenueRange).toBe("$1B-$5B");
+    expect(profile.firmographics).toMatchObject({ employeeCount: 5500, industry: "Gaming", hqLocation: "Boston, MA", ticker: "DKNG" });
+    // A bare hostname must be normalized, or the URL-typed source field fails the account.
+    expect(profile.firmographics.source.url).toBe("https://draftkings.com/");
+  });
+
+  it("declines to invent a revenue figure ZoomInfo did not supply", () => {
+    // Number(null) and Number("") are both 0, which previously scored a real company as
+    // "Under $50M" and marked that fabricated zero verified.
+    expect(revenueMillionsFromRecord({ revenue: null })).toBeNull();
+    expect(revenueMillionsFromRecord({ revenue: "" })).toBeNull();
+    expect(revenueMillionsFromRecord({})).toBeNull();
+    // Implausible output means the documented unit did not hold for this record.
+    expect(revenueMillionsFromRecord({ revenue: 4_800_000_000_000 })).toBeNull();
+    expect(formatRevenueBand(null)).toBeUndefined();
+  });
+
   it("applies one canonical update to duplicate account rows", () => {
     const signal = buildSignalFromToolResults("marriott-vacations", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
     applyZoomInfoUpdates([{ canonicalCompanyId: "marriott-vacations", zoominfoCompanyId: "456", signal, buyers: [] }]);
@@ -76,6 +117,44 @@ describe("ZoomInfo MCP normalization", () => {
     expect(rows.every((account) => account.providerIds?.zoominfoCompanyId === "456")).toBe(true);
     expect(rows.map((account) => account.signal.accountId).sort()).toEqual(["marriott-vacations", "marriott-vacations-corp"]);
     expect(rows.every((account) => account.signal.type === "No current signal")).toBe(true);
+  });
+
+  it("keeps the Aberdeen warm path when ZoomInfo supplies its own contacts", () => {
+    const signal = buildSignalFromToolResults("draftkings", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
+    const contact = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data" }, "123", 1)!;
+    applyZoomInfoUpdates([{ canonicalCompanyId: "draftkings", zoominfoCompanyId: "789", signal, buyers: [contact] }]);
+
+    const account = getSessionAccounts().find((item) => item.id === "draftkings")!;
+    // ZoomInfo knows nothing about Aberdeen's relationships, so replacing the buyer list
+    // outright silently erased the warm path and the relationship points that go with it.
+    expect(account.buyers.map((buyer) => buyer.name)).toContain("Jordan Example");
+    expect(account.buyers.some((buyer) => buyer.warmth === "Warm")).toBe(true);
+    // Unknown-warmth seeded placeholders are superseded by the real named contact.
+    expect(account.buyers.filter((buyer) => buyer.warmth === "Unknown")).toHaveLength(1);
+  });
+
+  it("promotes ZoomInfo firmographics over seeded demo research", () => {
+    const signal = buildSignalFromToolResults("moove", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
+    const profile = buildCompanyProfile({ name: "Moove Africa B.V.", revenue: 240_000, employeeCount: 900, primaryIndustry: "Mobility fintech" });
+    applyZoomInfoUpdates([{ canonicalCompanyId: "moove", zoominfoCompanyId: "321", signal, buyers: [], profile }]);
+
+    const account = getSessionAccounts().find((item) => item.id === "moove")!;
+    // Seeded revenue was null and unscoreable; a verified figure now reaches the ICP band.
+    expect(account.revenueMillions).toBe(240);
+    expect(account.revenueRange).toBe("$50M-$1B");
+    expect(account.source.provenance).toBe("verified");
+    expect(account.firmographics?.employeeCount).toBe(900);
+  });
+
+  it("leaves seeded revenue alone when ZoomInfo has no figure", () => {
+    const signal = buildSignalFromToolResults("meta", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
+    const profile = buildCompanyProfile({ name: "Meta Platforms, Inc.", employeeCount: 70_000 });
+    applyZoomInfoUpdates([{ canonicalCompanyId: "meta", zoominfoCompanyId: "555", signal, buyers: [], profile }]);
+
+    const account = getSessionAccounts().find((item) => item.id === "meta")!;
+    expect(account.revenueMillions).toBe(164000);
+    expect(account.revenueRange).toBe("$100B+");
+    expect(account.source.provenance).toBe("demo");
   });
 });
 

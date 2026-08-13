@@ -14,6 +14,30 @@ export type SourceReference = z.infer<typeof sourceReferenceSchema>;
 export const relationshipWarmthSchema = z.enum(["Warm", "Indirect", "No known relationship", "Unknown"]);
 export type RelationshipWarmth = z.infer<typeof relationshipWarmthSchema>;
 
+// A refresh surfaces one headline signal but observes many triggers. The rest are kept as
+// evidence so scoring, offering matching, and the workspace can cite what was actually seen
+// instead of restating the headline.
+export const intentTopicSchema = z.object({
+  topic: z.string(),
+  score: z.number(),
+  date: z.string(),
+});
+export type IntentTopic = z.infer<typeof intentTopicSchema>;
+
+export const scoopSchema = z.object({
+  type: z.string(),
+  summary: z.string(),
+  date: z.string(),
+  url: z.string().optional(),
+});
+export type Scoop = z.infer<typeof scoopSchema>;
+
+export const signalEvidenceSchema = z.object({
+  intentTopics: z.array(intentTopicSchema).default([]),
+  scoops: z.array(scoopSchema).default([]),
+});
+export type SignalEvidence = z.infer<typeof signalEvidenceSchema>;
+
 export const signalSchema = z.object({
   id: z.string(),
   accountId: z.string(),
@@ -26,6 +50,9 @@ export const signalSchema = z.object({
   activeWithin90Days: z.boolean().nullable(),
   transformationEvidence: z.boolean().nullable(),
   mergerOrAcquisition: z.boolean().nullable(),
+  // Defaulted so seeded rows and account snapshots persisted before evidence existed
+  // still parse rather than failing the whole refresh.
+  evidence: signalEvidenceSchema.default({ intentTopics: [], scoops: [] }),
 });
 export type Signal = z.infer<typeof signalSchema>;
 
@@ -43,6 +70,20 @@ export const buyerSchema = z.object({
 });
 export type Buyer = z.infer<typeof buyerSchema>;
 
+// Company facts ZoomInfo returns alongside the domain match. Present only after a live
+// refresh, which is what lets scoring mark revenue verified instead of seeded research.
+export const firmographicsSchema = z.object({
+  employeeCount: z.number().nullable().optional(),
+  revenueMillions: z.number().nullable().optional(),
+  industry: z.string().optional(),
+  hqLocation: z.string().optional(),
+  companyType: z.string().optional(),
+  ticker: z.string().optional(),
+  foundedYear: z.number().optional(),
+  source: sourceReferenceSchema,
+});
+export type Firmographics = z.infer<typeof firmographicsSchema>;
+
 export const accountSchema = z.object({
   id: z.string(),
   canonicalCompanyId: z.string(),
@@ -55,6 +96,7 @@ export const accountSchema = z.object({
   source: sourceReferenceSchema,
   signal: signalSchema,
   buyers: z.array(buyerSchema),
+  firmographics: firmographicsSchema.optional(),
   providerIds: z.object({ zoominfoCompanyId: z.string().optional() }).optional(),
   duplicateOf: z.string().optional(),
 });

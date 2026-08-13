@@ -59,6 +59,8 @@ function signalFor(id: string): Signal {
     activeWithin90Days: value.activeWithin90Days ?? null,
     transformationEvidence: value.transformationEvidence ?? null,
     mergerOrAcquisition: value.mergerOrAcquisition ?? null,
+    // Seeded rows carry no observed evidence; a live ZoomInfo refresh populates this.
+    evidence: { intentTopics: [], scoops: [] },
   };
 }
 
