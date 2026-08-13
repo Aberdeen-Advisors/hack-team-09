@@ -231,11 +231,20 @@ function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefine
     .join(", ");
 }
 
+// ZoomInfo deprecates tools in place: the old name keeps returning data with a warning
+// appended. Record the successor's declared parameters so a migration can be made from
+// the server's own contract rather than guessing at the newer argument names.
+let supersededToolSummary: string | undefined;
+
 async function discoverRequiredTools(client: Client): Promise<void> {
   const listed = await client.listTools();
   const names = listed.tools.map((tool) => tool.name);
   const missing = REQUIRED_TOOLS.filter((name) => !names.includes(name));
   lookupSchemaSummary = summarizeToolSchema(listed.tools.find((tool) => tool.name === "lookup") ?? {});
+  const successors = listed.tools.filter((tool) => REQUIRED_TOOLS.some((required) => tool.name.startsWith(`${required}_v`)));
+  supersededToolSummary = successors.length
+    ? successors.map((tool) => `${tool.name}(${summarizeToolSchema(tool) || "no declared properties"})`).join("; ")
+    : undefined;
   await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0 });
   if (missing.length) throw new Error(`ZoomInfo account is missing required MCP tools: ${missing.join(", ")}`);
 }
@@ -375,12 +384,9 @@ function resultText(result: UnknownRecord): string {
   return content.map((item) => asRecord(item)?.text).filter((value): value is string => typeof value === "string").join("\n");
 }
 
-// ZoomInfo returns structuredContent as a JSON string rather than a decoded object.
-function decodeJson(value: unknown): unknown {
-  if (typeof value !== "string" || !value.trim()) return value;
-  try { return JSON.parse(value); } catch { /* fall through to the per-line attempt */ }
-  // resultText joins multiple content blocks with newlines, and a run of JSON values is
-  // not itself valid JSON, so recover whichever lines do parse.
+// resultText joins multiple content blocks with newlines, and a run of JSON values is
+// not itself valid JSON, so recover whichever lines do parse.
+function decodeConcatenatedJson(value: string): unknown {
   const decoded = value.split("\n").flatMap((line) => {
     if (!line.trim()) return [];
     try { return [JSON.parse(line) as unknown]; } catch { return []; }
@@ -393,13 +399,28 @@ function decodeJson(value: unknown): unknown {
   if (envelopes.length !== decoded.length) return decoded;
   const merged: UnknownRecord = {};
   for (const envelope of envelopes) {
-    for (const [key, value_] of Object.entries(envelope)) {
+    for (const [key, value] of Object.entries(envelope)) {
       const existing = merged[key];
-      if (Array.isArray(existing) && Array.isArray(value_)) merged[key] = [...existing, ...value_];
-      else if (existing === undefined) merged[key] = value_;
+      if (Array.isArray(existing) && Array.isArray(value)) merged[key] = [...existing, ...value];
+      else if (existing === undefined) merged[key] = value;
     }
   }
   return merged;
+}
+
+// ZoomInfo returns structuredContent as a JSON string, and that string is itself a
+// JSON-encoded string, so a single parse yields more text instead of records. Keep
+// unwrapping until something structured appears.
+function decodeJson(value: unknown): unknown {
+  let current = value;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (typeof current !== "string" || !current.trim()) return current;
+    let parsed: unknown;
+    try { parsed = JSON.parse(current); } catch { return decodeConcatenatedJson(current); }
+    if (parsed === current) return current;
+    current = parsed;
+  }
+  return current;
 }
 
 function isUsablePayload(value: unknown): boolean {
@@ -484,8 +505,11 @@ function numberValue(record: UnknownRecord, keys: string[]): number | undefined 
 export function payloadPreview(payload: unknown): string {
   if (payload === null || payload === undefined) return `payload was ${String(payload)}`;
   if (typeof payload === "string") {
-    let reason = "it parsed on retry";
-    try { JSON.parse(payload); } catch (error) { reason = error instanceof Error ? error.message : String(error); }
+    let reason: string;
+    try {
+      const parsed: unknown = JSON.parse(payload);
+      reason = `it parsed to ${Array.isArray(parsed) ? "an array" : typeof parsed}, not records`;
+    } catch (error) { reason = error instanceof Error ? error.message : String(error); }
     return `payload was ${payload.length} chars of unparsable text (${reason}); starts "${payload.slice(0, 80)}"; ends "${payload.slice(-80)}"`;
   }
   if (Array.isArray(payload)) return `payload was an array of ${payload.length}`;
@@ -777,7 +801,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
       lastSuccessfulRefreshAt: new Date().toISOString(),
       cacheExpiresAt: cacheExpirations.length ? new Date(Math.min(...cacheExpirations)).toISOString() : undefined,
       error: undefined,
-      lastRefreshNote: intentNote,
+      lastRefreshNote: [intentNote, supersededToolSummary && `Newer ZoomInfo tools are available: ${supersededToolSummary}`].filter(Boolean).join(" "),
     });
     return {
       accounts: updatedAccounts,

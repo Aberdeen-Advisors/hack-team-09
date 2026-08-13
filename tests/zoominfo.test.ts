@@ -111,6 +111,24 @@ describe("ZoomInfo response decoding", () => {
     expect(() => zoomInfoInternalsForTests.extractToolPayload({ isError: true, content: [{ type: "text", text: "quota exceeded" }] })).toThrow("quota exceeded");
   });
 
+  it("unwraps the double-encoded JSON string ZoomInfo actually returns", () => {
+    // Observed live: structuredContent is a JSON string whose value is another JSON
+    // string, so one parse yields text rather than records. Warnings ride alongside.
+    const envelope = { ...companies, meta: { warnings: ["search_companies was deprecated on August 1, 2026. Use search_companies_v2 instead."] } };
+    const doubleEncoded = JSON.stringify(JSON.stringify(envelope));
+
+    const payload = zoomInfoInternalsForTests.extractToolPayload({ structuredContent: JSON.parse(doubleEncoded) });
+    expect(payload).toEqual(envelope);
+
+    const records = zoomInfoInternalsForTests.findRecords(payload, ["companies", "results", "data", "records"]);
+    expect(records).toHaveLength(1);
+    expect(recordDomains(records[0])).toContain("draftkings.com");
+  });
+
+  it("reports what a decoded payload turned out to be when it is not records", () => {
+    expect(payloadPreview(JSON.stringify("still just text"))).toContain("parsed to string, not records");
+  });
+
   it("falls back to the text content when structuredContent is truncated", () => {
     const full = JSON.stringify(companies);
     const truncated = full.slice(0, 60);
