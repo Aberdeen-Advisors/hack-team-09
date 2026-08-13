@@ -23,6 +23,20 @@ describe("ZoomInfo MCP normalization", () => {
     expect(signal.source.label).toBe("ZoomInfo licensed signal");
   });
 
+  it("still produces a scoop signal when intent topics could not be resolved", () => {
+    const signal = buildSignalFromToolResults(
+      "draftkings",
+      {},
+      { scoops: [{ scoopId: "scoop-9", scoopType: "Mergers & Acquisitions (M&A)", originalPublishedDate: "2026-07-30", description: "Agreed to acquire a competitor." }] },
+      new Date("2026-08-13T12:00:00.000Z"),
+    );
+
+    expect(signal.type).toBe("M&A");
+    expect(signal.mergerOrAcquisition).toBe(true);
+    expect(signal.activeWithin90Days).toBe(true);
+    expect(signal.source.label).toBe("ZoomInfo licensed signal");
+  });
+
   it("returns a verified no-signal state instead of synthetic fallback data", () => {
     const signal = buildSignalFromToolResults(
       "draftkings",

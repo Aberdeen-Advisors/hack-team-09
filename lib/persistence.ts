@@ -18,6 +18,9 @@ export type ZoomInfoMeta = {
   error?: string;
   lastSuccessfulRefreshAt?: string;
   cacheExpiresAt?: string;
+  // Degraded-but-successful refresh detail. Kept separate from `error` because that
+  // field pins the integration into an error state and blocks further refreshes.
+  lastRefreshNote?: string;
 };
 
 export type StoredCompanyCache = {

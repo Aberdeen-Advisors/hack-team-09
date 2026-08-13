@@ -217,10 +217,25 @@ async function closeClient(client: Client, transport: StreamableHTTPClientTransp
   try { await client.close(); } catch { /* already closed */ }
 }
 
+// ZoomInfo does not publish argument shapes for its MCP tools, so the server's own
+// declared schema is the only authoritative description of what `lookup` accepts.
+let lookupSchemaSummary: string | undefined;
+
+function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefined {
+  const schema = asRecord(tool.inputSchema);
+  const properties = asRecord(schema?.properties);
+  if (!properties) return undefined;
+  const required = Array.isArray(schema?.required) ? schema.required.filter((name): name is string => typeof name === "string") : [];
+  return Object.entries(properties)
+    .map(([name, value]) => `${name}${required.includes(name) ? "*" : ""}: ${stringValue(asRecord(value) ?? {}, ["type"]) || "unknown"}`)
+    .join(", ");
+}
+
 async function discoverRequiredTools(client: Client): Promise<void> {
   const listed = await client.listTools();
   const names = listed.tools.map((tool) => tool.name);
   const missing = REQUIRED_TOOLS.filter((name) => !names.includes(name));
+  lookupSchemaSummary = summarizeToolSchema(listed.tools.find((tool) => tool.name === "lookup") ?? {});
   await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0 });
   if (missing.length) throw new Error(`ZoomInfo account is missing required MCP tools: ${missing.join(", ")}`);
 }
@@ -314,6 +329,7 @@ export async function zoomInfoIntegrationSnapshot(admin = false) {
     lastSuccessfulRefreshAt: meta.lastSuccessfulRefreshAt,
     cacheExpiresAt: meta.cacheExpiresAt,
     error: admin ? meta.error || configError : undefined,
+    note: admin ? meta.lastRefreshNote : undefined,
   };
 }
 
@@ -426,9 +442,17 @@ function collectStringArray(value: unknown, key: string): string[] {
   return [...directValues, ...Object.values(record).flatMap((nested) => nested && typeof nested === "object" ? collectStringArray(nested, key) : [])];
 }
 
-async function resolveIntentTopics(client: Client): Promise<string[]> {
+// Returns the resolved topics plus, when resolution failed, a note explaining why.
+// Intent is one of two signal sources, so an empty result degrades the refresh to
+// Scoops-only rather than failing it outright.
+async function resolveIntentTopics(client: Client): Promise<{ topics: string[]; note?: string }> {
   const queries = topicQueries();
-  const payload = await callTool(client, "lookup", { fields: queries.map((fuzzyMatch) => ({ fieldName: "intent-topics", fuzzyMatch })), userIntent: "Resolve approved intent topics for Aberdeen signal monitoring." });
+  let payload: unknown;
+  try {
+    payload = await callTool(client, "lookup", { fields: queries.map((fuzzyMatch) => ({ fieldName: "intent-topics", fuzzyMatch })), userIntent: "Resolve approved intent topics for Aberdeen signal monitoring." });
+  } catch (error) {
+    return { topics: [], note: `ZoomInfo intent topic lookup failed, so signals came from Scoops only: ${friendlyError(error)}${lookupSchemaSummary ? ` [lookup accepts ${lookupSchemaSummary}]` : ""}` };
+  }
   const records = findRecords(payload, ["topicDetails", "topics", "results", "data", "records"]);
   const topics = records.flatMap((record) => {
     const value = stringValue(record, ["topic", "name", "value", "label"]);
@@ -436,8 +460,9 @@ async function resolveIntentTopics(client: Client): Promise<string[]> {
   });
   topics.push(...collectStringArray(payload, "topics"));
   const unique = [...new Set(topics)].slice(0, 50);
-  if (!unique.length) throw new Error("ZoomInfo lookup returned no valid intent topics for the configured queries");
-  return unique;
+  if (unique.length) return { topics: unique };
+  const shape = Object.keys(asRecord(payload) ?? {}).join(", ") || typeof payload;
+  return { topics: [], note: `ZoomInfo lookup returned no intent topics for ${queries.join(", ")}, so signals came from Scoops only. Response contained: ${shape}.${lookupSchemaSummary ? ` Lookup accepts ${lookupSchemaSummary}.` : ""}` };
 }
 
 type SignalCandidate = { id: string; type: Signal["type"]; summary: string; url?: string; date: string; intentScore: number; relevantIntent: boolean; transformationEvidence: boolean; mergerOrAcquisition: boolean };
@@ -547,11 +572,21 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
   const company = await resolveCompany(client, account);
   const lookbackDays = Number(process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90);
   const startDate = isoDateDaysAgo(lookbackDays);
-  const [intentPayload, scoopsPayload, buyers] = await Promise.all([
-    callTool(client, "enrich_intent", { companyId: company.companyId, topics, signalScoreMin: 70, signalStartDate: startDate, sort: "-signalDate", pageSize: 25, userIntent: "Find recent buying intent relevant to Aberdeen AI strategy, product, modernization, and adoption services." }),
+  // Intent needs resolved topics and Scoops does not, so they fail independently.
+  // Buyers are supporting context; losing them must not discard a usable signal.
+  const [intentResult, scoopsResult, buyersResult] = await Promise.allSettled([
+    topics.length
+      ? callTool(client, "enrich_intent", { companyId: company.companyId, topics, signalScoreMin: 70, signalStartDate: startDate, sort: "-signalDate", pageSize: 25, userIntent: "Find recent buying intent relevant to Aberdeen AI strategy, product, modernization, and adoption services." })
+      : Promise.resolve({}),
     callTool(client, "enrich_scoops", { zoominfoCompanyIds: [company.companyId], publishedStartDate: startDate, scoopTypes: RELEVANT_SCOOP_TYPES, sort: "-originalPublishedDate", pageSize: 25, userIntent: "Find recent business events that may create a credible consulting outreach trigger." }),
     fetchBuyers(client, company.companyId),
   ]);
+  // Reporting "no current signal" when both sources errored would misrepresent a
+  // failed lookup as a verified absence of triggers.
+  if (intentResult.status === "rejected" && scoopsResult.status === "rejected") throw scoopsResult.reason;
+  const intentPayload = intentResult.status === "fulfilled" ? intentResult.value : {};
+  const scoopsPayload = scoopsResult.status === "fulfilled" ? scoopsResult.value : {};
+  const buyers = buyersResult.status === "fulfilled" ? buyersResult.value : [];
   return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal: buildSignalFromToolResults(account.id, intentPayload, scoopsPayload), buyers };
 }
 
@@ -591,7 +626,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
     connection = await connectClient();
     const client = connection.client;
     await discoverRequiredTools(client);
-    const topics = await resolveIntentTopics(client);
+    const { topics, note: intentNote } = await resolveIntentTopics(client);
     const currentAccounts = await loadAccounts();
     const candidates = refreshCandidates(currentAccounts);
     const ttlMs = Number(process.env.ZOOMINFO_CACHE_TTL_MINUTES || 1440) * 60_000;
@@ -633,6 +668,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
       lastSuccessfulRefreshAt: new Date().toISOString(),
       cacheExpiresAt: cacheExpirations.length ? new Date(Math.min(...cacheExpirations)).toISOString() : undefined,
       error: undefined,
+      lastRefreshNote: intentNote,
     });
     return {
       accounts: updatedAccounts,

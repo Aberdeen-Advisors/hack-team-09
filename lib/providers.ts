@@ -146,7 +146,7 @@ export async function integrationStatus(admin = false): Promise<IntegrationStatu
   const zoomMessage = zoomInfo.state === "mock"
     ? "Using deduplicated synthetic signals. Set ZOOMINFO_PROVIDER=mcp to enable the local OAuth connection."
     : zoomInfo.state === "ready"
-      ? `Connected to ZoomInfo MCP with required tools ready; ${zoomInfo.liveAccounts} of ${zoomInfo.totalCanonicalAccounts} accounts currently have live signals.`
+      ? `Connected to ZoomInfo MCP with required tools ready; ${zoomInfo.liveAccounts} of ${zoomInfo.totalCanonicalAccounts} accounts currently have live signals.${zoomInfo.note ? ` ${zoomInfo.note}` : ""}`
       : admin
         ? zoomInfo.error || "ZoomInfo MCP is configured but not connected."
         : "ZoomInfo is not connected. An administrator can manage the connection.";
