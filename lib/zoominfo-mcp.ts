@@ -35,19 +35,51 @@ function redirectUri(): string {
   return process.env.ZOOMINFO_MCP_REDIRECT_URI || "http://localhost:3000/api/integrations/zoominfo/callback";
 }
 
-function clientCredentials(): { clientId: string; clientSecret: string } {
-  const clientId = process.env.ZOOMINFO_MCP_CLIENT_ID;
-  const clientSecret = process.env.ZOOMINFO_MCP_CLIENT_SECRET;
-  if (!clientId || !clientSecret) throw new Error("ZoomInfo MCP client ID and secret are not configured");
-  return { clientId, clientSecret };
+// ZoomInfo registers MCP apps in Okta, which rejects the whole token request with
+// "The client secret supplied for a confidential client is invalid" whenever the
+// presented client-authentication style does not match the registration. Okta accepts
+// all three, so the working style is a property of the registration, not of this code.
+// "none" is a public PKCE client that sends no secret at all.
+type ClientAuthMethod = "client_secret_post" | "client_secret_basic" | "none";
+
+function clientAuthMethod(): ClientAuthMethod {
+  const configured = process.env.ZOOMINFO_MCP_AUTH_METHOD?.trim().toLowerCase();
+  if (configured === "basic" || configured === "client_secret_basic") return "client_secret_basic";
+  if (configured === "none" || configured === "public") return "none";
+  return "client_secret_post";
+}
+
+// Values pasted into a Vercel environment variable routinely carry a trailing newline
+// or space, which Okta reports as an invalid secret rather than a malformed request.
+function clientCredentials(): { clientId: string; clientSecret?: string } {
+  const clientId = process.env.ZOOMINFO_MCP_CLIENT_ID?.trim();
+  const clientSecret = process.env.ZOOMINFO_MCP_CLIENT_SECRET?.trim();
+  if (!clientId) throw new Error("ZOOMINFO_MCP_CLIENT_ID is not configured");
+  if (!clientSecret && clientAuthMethod() !== "none") throw new Error("ZOOMINFO_MCP_CLIENT_SECRET is not configured");
+  return { clientId, clientSecret: clientSecret || undefined };
 }
 
 function configurationError(): string | undefined {
   if (zoomInfoMode() !== "mcp") return undefined;
-  if (!process.env.ZOOMINFO_MCP_CLIENT_ID || !process.env.ZOOMINFO_MCP_CLIENT_SECRET) return "ZoomInfo MCP client ID and secret are not configured.";
+  if (!process.env.ZOOMINFO_MCP_CLIENT_ID?.trim()) return "ZOOMINFO_MCP_CLIENT_ID is not configured.";
+  if (!process.env.ZOOMINFO_MCP_CLIENT_SECRET?.trim() && clientAuthMethod() !== "none") return "ZOOMINFO_MCP_CLIENT_SECRET is not configured.";
   if (!tokenEncryptionConfigured()) return "ZOOMINFO_TOKEN_ENCRYPTION_KEY is missing or invalid.";
   if (process.env.NODE_ENV === "production" && !redisConfigured()) return "Upstash Redis is required for ZoomInfo MCP in production.";
   return undefined;
+}
+
+// Reports how the credentials were shaped without ever revealing them, so an
+// invalid-client failure can be diagnosed from the integration drawer instead of guessing.
+export function credentialDiagnostics(): string {
+  const rawId = process.env.ZOOMINFO_MCP_CLIENT_ID || "";
+  const rawSecret = process.env.ZOOMINFO_MCP_CLIENT_SECRET || "";
+  const padded = [rawId !== rawId.trim() ? "client ID" : undefined, rawSecret !== rawSecret.trim() ? "client secret" : undefined].filter(Boolean);
+  return [
+    `auth method ${clientAuthMethod()}`,
+    `client ID ${rawId.trim().length} chars starting "${rawId.trim().slice(0, 4)}"`,
+    rawSecret.trim() ? `client secret ${rawSecret.trim().length} chars` : "no client secret set",
+    padded.length ? `trimmed surrounding whitespace from ${padded.join(" and ")}` : undefined,
+  ].filter(Boolean).join("; ");
 }
 
 export function zoomInfoOAuthEnabled(): boolean {
@@ -59,7 +91,21 @@ function friendlyError(error: unknown): string {
   return message.replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]").slice(0, 400);
 }
 
-class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
+function isCredentialRejection(error: unknown): boolean {
+  const code = typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code.toLowerCase() : "";
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return code === "invalid_client" || code === "unauthorized_client" || message.includes("invalid_client") || message.includes("client secret");
+}
+
+// The authorization server reports every credential problem with the same opaque text,
+// so attach how the credentials were shaped to distinguish a wrong secret from a
+// registration that expects a different client-authentication style.
+function authorizationError(error: unknown): string {
+  const message = friendlyError(error);
+  return isCredentialRejection(error) ? `${message} [${credentialDiagnostics()}]` : message;
+}
+
+export class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
   private flowState?: string;
 
   constructor(private readonly persistence: AppPersistence, private readonly consumedPending?: PendingOAuth) {
@@ -75,9 +121,26 @@ class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
       redirect_uris: [redirectUri()],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method: "client_secret_post",
+      token_endpoint_auth_method: clientAuthMethod(),
     };
   }
+
+  // The SDK only honours our token_endpoint_auth_method when the authorization server
+  // advertises it, and silently downgrades to client_secret_basic otherwise. This hook
+  // takes precedence over that selection entirely, so the configured method is what is
+  // actually sent. Declared as a bound property because the SDK reads it off the provider
+  // and calls it detached from `this`.
+  addClientAuthentication = async (headers: Headers, params: URLSearchParams): Promise<void> => {
+    const { clientId, clientSecret } = clientCredentials();
+    params.set("client_id", clientId);
+    if (clientAuthMethod() === "none" || !clientSecret) return;
+    if (clientAuthMethod() === "client_secret_basic") {
+      params.delete("client_secret");
+      headers.set("Authorization", `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`);
+      return;
+    }
+    params.set("client_secret", clientSecret);
+  };
 
   async state(): Promise<string> {
     if (this.flowState) return this.flowState;
@@ -88,10 +151,7 @@ class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
 
   clientInformation(): StoredOAuthClientInformation {
     const { clientId, clientSecret } = clientCredentials();
-    // Without this, the SDK ignores our intended auth method and auto-selects
-    // client_secret_basic whenever ZoomInfo's Okta discovery metadata lists it
-    // as supported, which ZoomInfo then rejects as an invalid client secret.
-    return { client_id: clientId, client_secret: clientSecret, token_endpoint_auth_method: "client_secret_post" };
+    return { client_id: clientId, client_secret: clientSecret, token_endpoint_auth_method: clientAuthMethod() };
   }
 
   async tokens(): Promise<StoredOAuthTokens | undefined> {
@@ -182,7 +242,7 @@ export async function beginZoomInfoAuthorization(): Promise<string> {
     const state = provider.currentState;
     const pending = state ? await persistence.getPendingOAuth(state) : null;
     if (error instanceof UnauthorizedError && pending?.authorizationUrl) return pending.authorizationUrl;
-    await persistence.updateZoomInfoMeta({ error: friendlyError(error), authorizationPendingUntil: undefined });
+    await persistence.updateZoomInfoMeta({ error: authorizationError(error), authorizationPendingUntil: undefined });
     throw error;
   } finally {
     if (connection) await closeClient(connection.client, connection.transport);
@@ -204,8 +264,14 @@ export async function completeZoomInfoAuthorization(params: URLSearchParams): Pr
   }
   const provider = new DurableZoomInfoOAuthProvider(persistence, pending);
   const transport = newTransport(provider);
+  // Rethrow with the diagnostics attached so the callback redirect surfaces them in the
+  // toast, not just in the admin-only drawer.
   try { await transport.finishAuth(params); }
-  catch (error) { await persistence.updateZoomInfoMeta({ error: friendlyError(error), authorizationPendingUntil: undefined }); throw error; }
+  catch (error) {
+    const message = authorizationError(error);
+    await persistence.updateZoomInfoMeta({ error: message, authorizationPendingUntil: undefined });
+    throw new Error(message);
+  }
   finally { try { await transport.close(); } catch { /* transport was not connected */ } }
   let connection: { client: Client; transport: StreamableHTTPClientTransport } | undefined;
   try {

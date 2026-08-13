@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { appPersistence, resetPersistenceForTests } from "@/lib/persistence";
 import { applyZoomInfoUpdates, getSessionAccounts, resetSessionAccountsForTests } from "@/lib/session-store";
-import { buildSignalFromToolResults, normalizeBuyerFromContact, resetZoomInfoStateForTests } from "@/lib/zoominfo-mcp";
+import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, resetZoomInfoStateForTests } from "@/lib/zoominfo-mcp";
 
 describe("ZoomInfo MCP normalization", () => {
   beforeEach(() => {
@@ -53,5 +54,61 @@ describe("ZoomInfo MCP normalization", () => {
     expect(rows.every((account) => account.providerIds?.zoominfoCompanyId === "456")).toBe(true);
     expect(rows.map((account) => account.signal.accountId).sort()).toEqual(["marriott-vacations", "marriott-vacations-corp"]);
     expect(rows.every((account) => account.signal.type === "No current signal")).toBe(true);
+  });
+});
+
+describe("ZoomInfo OAuth client authentication", () => {
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    resetPersistenceForTests();
+    process.env.ZOOMINFO_MCP_CLIENT_ID = "  client-abc  ";
+    process.env.ZOOMINFO_MCP_CLIENT_SECRET = "  secret-xyz\n";
+    delete process.env.ZOOMINFO_MCP_AUTH_METHOD;
+  });
+
+  afterEach(() => { process.env = { ...originalEnv }; });
+
+  function authenticate() {
+    const provider = new DurableZoomInfoOAuthProvider(appPersistence());
+    const headers = new Headers();
+    const params = new URLSearchParams();
+    return provider.addClientAuthentication(headers, params).then(() => ({ headers, params }));
+  }
+
+  it("trims whitespace pasted around the configured credentials", async () => {
+    const { params } = await authenticate();
+    expect(params.get("client_id")).toBe("client-abc");
+    expect(params.get("client_secret")).toBe("secret-xyz");
+  });
+
+  it("sends the secret in the request body by default", async () => {
+    const { headers, params } = await authenticate();
+    expect(params.get("client_secret")).toBe("secret-xyz");
+    expect(headers.get("authorization")).toBeNull();
+  });
+
+  it("sends the secret as a basic authorization header when configured", async () => {
+    process.env.ZOOMINFO_MCP_AUTH_METHOD = "basic";
+    const { headers, params } = await authenticate();
+    expect(params.get("client_secret")).toBeNull();
+    expect(headers.get("authorization")).toBe(`Basic ${Buffer.from("client-abc:secret-xyz").toString("base64")}`);
+  });
+
+  it("omits the secret entirely for a public PKCE client", async () => {
+    process.env.ZOOMINFO_MCP_AUTH_METHOD = "none";
+    delete process.env.ZOOMINFO_MCP_CLIENT_SECRET;
+    const { headers, params } = await authenticate();
+    expect(params.get("client_id")).toBe("client-abc");
+    expect(params.get("client_secret")).toBeNull();
+    expect(headers.get("authorization")).toBeNull();
+  });
+
+  it("reports credential shape without revealing the secret", () => {
+    const diagnostics = credentialDiagnostics();
+    expect(diagnostics).toContain("client_secret_post");
+    expect(diagnostics).toContain("client secret 10 chars");
+    expect(diagnostics).toContain("trimmed surrounding whitespace from client ID and client secret");
+    expect(diagnostics).not.toContain("secret-xyz");
   });
 });

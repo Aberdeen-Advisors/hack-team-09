@@ -47,10 +47,28 @@ Set `OPENAI_USE_MOCK=false`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL` (de
 
 The default `ZOOMINFO_PROVIDER=mock` keeps the deterministic demo active. For a local live connection:
 
-1. In ZoomInfo's API/MCP area, create an MCP App and register `http://localhost:3000/api/integrations/zoominfo/callback` as a redirect URI.
-2. Set `ZOOMINFO_PROVIDER=mcp`, `ZOOMINFO_MCP_CLIENT_ID`, `ZOOMINFO_MCP_CLIENT_SECRET`, `ZOOMINFO_TOKEN_ENCRYPTION_KEY`, `ADMIN_PASSWORD`, and `ADMIN_SESSION_SECRET` in `.env.local`.
-3. Start the development server, open the integration diagnostics drawer, sign in as the administrator, and click **Connect ZoomInfo**.
+1. In ZoomInfo's API/MCP area, create an MCP App and register `http://localhost:3000/api/integrations/zoominfo/callback` as a redirect URI. Note which **client authentication** method the app is registered with.
+2. Set `ZOOMINFO_PROVIDER=mcp`, `ZOOMINFO_MCP_CLIENT_ID`, `ZOOMINFO_MCP_CLIENT_SECRET`, and `ZOOMINFO_TOKEN_ENCRYPTION_KEY` in `.env.local`.
+3. Start the development server, open the integration diagnostics drawer, and click **Connect ZoomInfo**.
 4. Complete ZoomInfo sign-in, then click **Refresh signals**.
+
+Dynamic client registration is not an option here: `https://mcp.zoominfo.com/oauth/register` rejects unknown callers with `Vendor with name … was not found in approved vendors`, so the client ID and secret must come from a ZoomInfo-issued MCP App.
+
+#### Client authentication method
+
+ZoomInfo authorizes through `https://mcp.zoominfo.com/oauth/authorize` but exchanges the code directly against Okta at `https://okta-login.zoominfo.com/oauth2/default/v1/token`. Okta accepts `client_secret_basic`, `client_secret_post`, and public PKCE clients, and rejects a mismatch against the app's registration with a single opaque message:
+
+> The client secret supplied for a confidential client is invalid.
+
+Because the authorize step is a permissive proxy that never validates the client ID, reaching the ZoomInfo sign-in screen does **not** confirm the credentials are correct — only the token exchange does. Set `ZOOMINFO_MCP_AUTH_METHOD` to match the registration:
+
+| Value | Sends |
+| --- | --- |
+| `post` (default) | `client_id` and `client_secret` in the request body |
+| `basic` | `client_id`/`client_secret` as an HTTP Basic header |
+| `none` | `client_id` and PKCE only, no secret (public client) |
+
+If connection fails, the integration drawer reports the selected method, the client ID length and prefix, the secret length, and whether stray whitespace was trimmed — enough to tell a wrong secret apart from a wrong method without exposing the secret itself.
 
 The app connects directly to `https://mcp.zoominfo.com/mcp` with OAuth Authorization Code + PKCE. Access and refresh tokens are encrypted with AES-256-GCM before storage. Local development uses process memory when Redis is absent; production requires Upstash Redis so OAuth state, tokens, account results, and cache entries survive Vercel function cold starts.
 
@@ -67,12 +85,15 @@ ZOOMINFO_PROVIDER=mcp
 ZOOMINFO_MCP_URL=https://mcp.zoominfo.com/mcp
 ZOOMINFO_MCP_CLIENT_ID=<ZoomInfo-issued client ID>
 ZOOMINFO_MCP_CLIENT_SECRET=<ZoomInfo-issued client secret>
+ZOOMINFO_MCP_AUTH_METHOD=post
 ZOOMINFO_MCP_REDIRECT_URI=https://hack-team-09.vercel.app/api/integrations/zoominfo/callback
 ZOOMINFO_TOKEN_ENCRYPTION_KEY=<base64-encoded 32-byte key>
 ADMIN_PASSWORD=<strong administrator password>
 ADMIN_SESSION_SECRET=<at least 32 random characters>
 SIGNAL_OUTREACH_REDIS_PREFIX=signal-outreach:production:v1
 ```
+
+Paste the client secret carefully: a trailing newline picked up from the Vercel dashboard is indistinguishable from a wrong secret in Okta's response. The app trims both credentials before use and reports when it had to.
 
 Generate the encryption key locally with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Generate the session secret independently. Never commit either value. After deployment, visitors can view the shared account snapshot, but only the signed-in administrator can connect or disconnect ZoomInfo or refresh signals.
 
