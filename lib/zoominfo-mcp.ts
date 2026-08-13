@@ -111,8 +111,10 @@ class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
     return codeVerifier;
   }
   async saveDiscoveryState(discoveryState: OAuthDiscoveryState): Promise<void> {
-    if (!this.flowState) throw new Error("ZoomInfo OAuth state was not initialized");
-    await this.persistence.updatePendingOAuth(this.flowState, { discoveryState }, OAUTH_PENDING_TTL_SECONDS);
+    // The SDK calls this before it ever calls state() (right after discovery,
+    // well before the authorization URL is built), so flowState may not exist yet.
+    const state = await this.state();
+    await this.persistence.updatePendingOAuth(state, { discoveryState }, OAUTH_PENDING_TTL_SECONDS);
   }
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
     const pending = this.consumedPending ?? (this.flowState ? await this.persistence.getPendingOAuth(this.flowState) : null);
