@@ -16,8 +16,12 @@ describe("ZoomInfo token encryption", () => {
 
   it("rejects tampered ciphertext and invalid keys", () => {
     const encrypted = encryptOAuthTokens({ access_token: "secret", token_type: "Bearer" });
-    const replacement = encrypted.endsWith("A") ? "B" : "A";
-    expect(() => decryptOAuthTokens(`${encrypted.slice(0, -1)}${replacement}`)).toThrow();
+    // Tamper with the first ciphertext character rather than the last: the trailing
+    // base64url character carries padding bits, so for roughly one random IV in
+    // seventeen the edit decoded to identical bytes and the tamper went undetected.
+    const [version, iv, tag, ciphertext] = encrypted.split(".");
+    const tampered = [version, iv, tag, `${ciphertext.startsWith("A") ? "B" : "A"}${ciphertext.slice(1)}`].join(".");
+    expect(() => decryptOAuthTokens(tampered)).toThrow();
     process.env.ZOOMINFO_TOKEN_ENCRYPTION_KEY = "not-a-32-byte-key";
     expect(tokenEncryptionConfigured()).toBe(false);
   });

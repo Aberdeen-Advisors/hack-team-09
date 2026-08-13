@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appPersistence, resetPersistenceForTests } from "@/lib/persistence";
 import { applyZoomInfoUpdates, getSessionAccounts, resetSessionAccountsForTests } from "@/lib/session-store";
-import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, recordDomains, resetZoomInfoStateForTests } from "@/lib/zoominfo-mcp";
+import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, recordDomains, resetZoomInfoStateForTests, zoomInfoInternalsForTests } from "@/lib/zoominfo-mcp";
 
 describe("ZoomInfo MCP normalization", () => {
   beforeEach(() => {
@@ -76,6 +76,56 @@ describe("ZoomInfo MCP normalization", () => {
     expect(rows.every((account) => account.providerIds?.zoominfoCompanyId === "456")).toBe(true);
     expect(rows.map((account) => account.signal.accountId).sort()).toEqual(["marriott-vacations", "marriott-vacations-corp"]);
     expect(rows.every((account) => account.signal.type === "No current signal")).toBe(true);
+  });
+});
+
+describe("ZoomInfo rate limit handling", () => {
+  const rateLimit = new Error('Error POSTing to endpoint: {"errors":[{"code":"ZI0004","detail":"Too many requests. Please retry after 1 second.","title":"Rate limit exceeded"}]}');
+
+  beforeEach(() => {
+    resetZoomInfoStateForTests();
+    process.env.ZOOMINFO_MCP_REQUEST_SPACING_MS = "0";
+  });
+
+  afterEach(() => { delete process.env.ZOOMINFO_MCP_REQUEST_SPACING_MS; });
+
+  it("recognizes ZoomInfo's quota error and not unrelated failures", () => {
+    expect(zoomInfoInternalsForTests.isRateLimited(rateLimit)).toBe(true);
+    expect(zoomInfoInternalsForTests.isRateLimited(new Error("No exact ZoomInfo domain match"))).toBe(false);
+  });
+
+  it("retries a rate-limited call instead of failing the account", async () => {
+    let attempts = 0;
+    const client = { callTool: async () => { attempts += 1; if (attempts < 3) throw rateLimit; return { structuredContent: { companies: [{ companyId: "1" }] } }; } };
+
+    const payload = await zoomInfoInternalsForTests.callTool(client as never, "search_companies", {});
+    expect(attempts).toBe(3);
+    expect(payload).toEqual({ companies: [{ companyId: "1" }] });
+  });
+
+  it("gives up after the configured attempts and surfaces the quota error", async () => {
+    process.env.ZOOMINFO_MCP_MAX_ATTEMPTS = "2";
+    let attempts = 0;
+    const client = { callTool: async () => { attempts += 1; throw rateLimit; } };
+
+    await expect(zoomInfoInternalsForTests.callTool(client as never, "search_companies", {})).rejects.toThrow("ZI0004");
+    expect(attempts).toBe(2);
+    delete process.env.ZOOMINFO_MCP_MAX_ATTEMPTS;
+  });
+
+  it("does not retry an error that is not a quota failure", async () => {
+    let attempts = 0;
+    const client = { callTool: async () => { attempts += 1; throw new Error("company not found"); } };
+
+    await expect(zoomInfoInternalsForTests.callTool(client as never, "search_companies", {})).rejects.toThrow("company not found");
+    expect(attempts).toBe(1);
+  });
+
+  it("keeps serving queued calls after one of them fails", async () => {
+    const client = { callTool: async ({ name }: { name: string }) => { if (name === "bad") throw new Error("boom"); return { structuredContent: { ok: true } }; } };
+
+    await expect(zoomInfoInternalsForTests.callTool(client as never, "bad", {})).rejects.toThrow("boom");
+    await expect(zoomInfoInternalsForTests.callTool(client as never, "good", {})).resolves.toEqual({ ok: true });
   });
 });
 

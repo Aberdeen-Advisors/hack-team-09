@@ -382,10 +382,42 @@ function extractToolPayload(result: unknown): unknown {
   try { return JSON.parse(text); } catch { return { text }; }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+function isRateLimited(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ZI0004|rate limit|too many requests|\b429\b/i.test(message);
+}
+
+// Refreshing an account fans out to a company search, two enrichments, and up to four
+// contact calls, and accounts ran two at a time, so ZoomInfo's per-second quota was
+// exceeded before any result came back. Every tool call is funnelled through one spaced
+// queue, and a rate-limited call backs off rather than failing the account outright.
+let toolQueue: Promise<unknown> = Promise.resolve();
+
 async function callTool(client: Client, name: string, args: UnknownRecord): Promise<unknown> {
-  const timeout = Number(process.env.ZOOMINFO_MCP_TIMEOUT_MS || 30000);
-  const result = await client.callTool({ name, arguments: args }, { signal: AbortSignal.timeout(timeout) });
-  return extractToolPayload(result as unknown);
+  const spacing = Math.max(0, Number(process.env.ZOOMINFO_MCP_REQUEST_SPACING_MS || 250));
+  const maxAttempts = Math.max(1, Number(process.env.ZOOMINFO_MCP_MAX_ATTEMPTS || 5));
+  const run = toolQueue.then(async () => {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        // Started after the queue slot is granted so waiting does not consume the budget.
+        const timeout = Number(process.env.ZOOMINFO_MCP_TIMEOUT_MS || 30000);
+        const result = await client.callTool({ name, arguments: args }, { signal: AbortSignal.timeout(timeout) });
+        const payload = extractToolPayload(result as unknown);
+        await delay(spacing);
+        return payload;
+      } catch (error) {
+        if (attempt >= maxAttempts || !isRateLimited(error)) throw error;
+        await delay(spacing * 2 ** attempt);
+      }
+    }
+  });
+  // Keep the queue moving when a call fails, and never surface that tail as unhandled.
+  toolQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 function stringValue(record: UnknownRecord, keys: string[]): string | undefined {
@@ -711,4 +743,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
 
 export function resetZoomInfoStateForTests(): void {
   resetPersistenceForTests();
+  toolQueue = Promise.resolve();
 }
+
+export const zoomInfoInternalsForTests = { callTool, isRateLimited };

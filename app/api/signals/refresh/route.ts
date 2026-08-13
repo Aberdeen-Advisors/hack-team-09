@@ -5,6 +5,10 @@ import { integrationStatus, providers } from "@/lib/providers";
 import { accountMetrics, listAccountDetails } from "@/lib/repository";
 import { refreshZoomInfoAccounts, ZoomInfoRefreshInProgressError, zoomInfoIntegrationSnapshot, zoomInfoMode } from "@/lib/zoominfo-mcp";
 
+// ZoomInfo tool calls are spaced to stay inside its per-second quota, so a full refresh
+// takes appreciably longer than the platform's default function budget allows.
+export const maxDuration = 60;
+
 export async function POST(request: NextRequest) {
   if (!validRequestOrigin(request)) return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
   if (zoomInfoMode() === "mcp") {
