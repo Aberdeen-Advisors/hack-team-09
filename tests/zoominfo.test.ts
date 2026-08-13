@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appPersistence, resetPersistenceForTests } from "@/lib/persistence";
 import { applyZoomInfoUpdates, getSessionAccounts, resetSessionAccountsForTests } from "@/lib/session-store";
-import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, recordDomains, resetZoomInfoStateForTests, zoomInfoInternalsForTests } from "@/lib/zoominfo-mcp";
+import { DurableZoomInfoOAuthProvider, buildSignalFromToolResults, credentialDiagnostics, normalizeBuyerFromContact, payloadPreview, recordDomains, resetZoomInfoStateForTests, zoomInfoInternalsForTests } from "@/lib/zoominfo-mcp";
 
 describe("ZoomInfo MCP normalization", () => {
   beforeEach(() => {
@@ -109,6 +109,37 @@ describe("ZoomInfo response decoding", () => {
 
   it("still surfaces a tool error instead of decoding it", () => {
     expect(() => zoomInfoInternalsForTests.extractToolPayload({ isError: true, content: [{ type: "text", text: "quota exceeded" }] })).toThrow("quota exceeded");
+  });
+
+  it("falls back to the text content when structuredContent is truncated", () => {
+    const full = JSON.stringify(companies);
+    const truncated = full.slice(0, 60);
+    const payload = zoomInfoInternalsForTests.extractToolPayload({
+      structuredContent: truncated,
+      content: [{ type: "text", text: full }],
+    });
+
+    expect(payload).toEqual(companies);
+    expect(zoomInfoInternalsForTests.findRecords(payload, ["data"])).toHaveLength(1);
+  });
+
+  it("recovers records when content arrives as newline-joined JSON blocks", () => {
+    const payload = zoomInfoInternalsForTests.extractToolPayload({
+      content: [{ type: "text", text: JSON.stringify(companies) }, { type: "text", text: JSON.stringify({ data: [] }) }],
+    });
+
+    expect(zoomInfoInternalsForTests.findRecords(payload, ["companies", "results", "data", "records"])).toHaveLength(1);
+  });
+
+  it("reports length, parse error, and the tail when nothing decodes", () => {
+    const broken = `${JSON.stringify(companies).slice(0, 60)}`;
+    const preview = payloadPreview(zoomInfoInternalsForTests.extractToolPayload({ structuredContent: broken }));
+
+    expect(preview).toContain(`${broken.length} chars`);
+    expect(preview).toMatch(/starts "/);
+    expect(preview).toMatch(/ends "/);
+    // The parse error is what distinguishes truncation from a malformed token.
+    expect(preview).toMatch(/JSON|Unexpected|Unterminated/i);
   });
 });
 

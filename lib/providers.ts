@@ -143,12 +143,15 @@ export async function integrationStatus(admin = false): Promise<IntegrationStatu
   const zoomInfo = await zoomInfoIntegrationSnapshot(admin);
   const checkedAt = new Date().toISOString();
   const zoomStatus = zoomInfo.state === "error" ? "error" : zoomInfo.state === "ready" || zoomInfo.state === "mock" ? "ready" : "not-configured";
+  // Stamp the running build on every admin-visible message so a report always identifies
+  // which deployment produced it.
+  const build = zoomInfo.build ? ` (build ${zoomInfo.build})` : "";
   const zoomMessage = zoomInfo.state === "mock"
     ? "Using deduplicated synthetic signals. Set ZOOMINFO_PROVIDER=mcp to enable the local OAuth connection."
     : zoomInfo.state === "ready"
-      ? `Connected to ZoomInfo MCP with required tools ready; ${zoomInfo.liveAccounts} of ${zoomInfo.totalCanonicalAccounts} accounts currently have live signals.${zoomInfo.note ? ` ${zoomInfo.note}` : ""}`
+      ? `Connected to ZoomInfo MCP with required tools ready; ${zoomInfo.liveAccounts} of ${zoomInfo.totalCanonicalAccounts} accounts currently have live signals.${zoomInfo.note ? ` ${zoomInfo.note}` : ""}${build}`
       : admin
-        ? zoomInfo.error || "ZoomInfo MCP is configured but not connected."
+        ? `${zoomInfo.error || "ZoomInfo MCP is configured but not connected."}${build}`
         : "ZoomInfo is not connected. An administrator can manage the connection.";
   return {
     demoMode: selected.useOpenAIMock || zoomInfo.liveAccounts < zoomInfo.totalCanonicalAccounts,

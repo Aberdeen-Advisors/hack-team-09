@@ -330,6 +330,9 @@ export async function zoomInfoIntegrationSnapshot(admin = false) {
     cacheExpiresAt: meta.cacheExpiresAt,
     error: admin ? meta.error || configError : undefined,
     note: admin ? meta.lastRefreshNote : undefined,
+    // Which build produced this report. Several rounds of debugging were spent unsure
+    // whether a fix was actually deployed.
+    build: admin ? process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) : undefined,
   };
 }
 
@@ -372,21 +375,52 @@ function resultText(result: UnknownRecord): string {
   return content.map((item) => asRecord(item)?.text).filter((value): value is string => typeof value === "string").join("\n");
 }
 
-// ZoomInfo returns structuredContent as a JSON string rather than a decoded object, so
-// passing it through left every consumer holding text where it expected records.
+// ZoomInfo returns structuredContent as a JSON string rather than a decoded object.
 function decodeJson(value: unknown): unknown {
   if (typeof value !== "string" || !value.trim()) return value;
-  try { return JSON.parse(value); } catch { return value; }
+  try { return JSON.parse(value); } catch { /* fall through to the per-line attempt */ }
+  // resultText joins multiple content blocks with newlines, and a run of JSON values is
+  // not itself valid JSON, so recover whichever lines do parse.
+  const decoded = value.split("\n").flatMap((line) => {
+    if (!line.trim()) return [];
+    try { return [JSON.parse(line) as unknown]; } catch { return []; }
+  });
+  if (!decoded.length) return value;
+  if (decoded.length === 1) return decoded[0];
+  // Each block is its own envelope, so combine their record arrays rather than returning
+  // a list of envelopes that would flatten into wrappers instead of companies.
+  const envelopes = decoded.filter((item): item is UnknownRecord => asRecord(item) !== undefined);
+  if (envelopes.length !== decoded.length) return decoded;
+  const merged: UnknownRecord = {};
+  for (const envelope of envelopes) {
+    for (const [key, value_] of Object.entries(envelope)) {
+      const existing = merged[key];
+      if (Array.isArray(existing) && Array.isArray(value_)) merged[key] = [...existing, ...value_];
+      else if (existing === undefined) merged[key] = value_;
+    }
+  }
+  return merged;
+}
+
+function isUsablePayload(value: unknown): boolean {
+  return Array.isArray(value) || asRecord(value) !== undefined;
 }
 
 function extractToolPayload(result: unknown): unknown {
   const record = asRecord(result);
   if (!record) return decodeJson(result);
   if (record.isError) throw new Error(resultText(record) || "ZoomInfo MCP tool returned an error");
-  if (record.structuredContent !== undefined) return decodeJson(record.structuredContent);
+  // structuredContent can arrive truncated while the complete JSON sits in the text
+  // content, so take whichever source actually yields records rather than trusting one.
   const text = resultText(record);
-  if (!text) return record;
-  try { return JSON.parse(text); } catch { return { text }; }
+  for (const candidate of [record.structuredContent, text]) {
+    if (candidate === undefined || candidate === "") continue;
+    const decoded = decodeJson(candidate);
+    if (isUsablePayload(decoded)) return decoded;
+  }
+  // Nothing decoded. Return a source verbatim so the diagnostics can describe it.
+  if (record.structuredContent !== undefined) return record.structuredContent;
+  return text || record;
 }
 
 function delay(ms: number): Promise<void> {
@@ -445,10 +479,16 @@ function numberValue(record: UnknownRecord, keys: string[]): number | undefined 
 }
 
 // Describes an unusable response without dumping licensed data into an error string.
-function payloadPreview(payload: unknown): string {
+// The parse error and the tail are what separate a truncated payload ("Unexpected end of
+// JSON input") from a malformed one, which a leading excerpt alone cannot show.
+export function payloadPreview(payload: unknown): string {
   if (payload === null || payload === undefined) return `payload was ${String(payload)}`;
-  if (typeof payload === "string") return `payload was text: "${payload.slice(0, 120)}"`;
-  if (Array.isArray(payload)) return `payload was an empty array`;
+  if (typeof payload === "string") {
+    let reason = "it parsed on retry";
+    try { JSON.parse(payload); } catch (error) { reason = error instanceof Error ? error.message : String(error); }
+    return `payload was ${payload.length} chars of unparsable text (${reason}); starts "${payload.slice(0, 80)}"; ends "${payload.slice(-80)}"`;
+  }
+  if (Array.isArray(payload)) return `payload was an array of ${payload.length}`;
   if (typeof payload === "object") return `payload keys: ${Object.keys(payload).join(", ").slice(0, 120)}`;
   return `payload was a ${typeof payload}`;
 }
@@ -472,7 +512,9 @@ async function resolveCompany(client: Client, account: Account): Promise<{ compa
   // the bare hostname, so searching with the raw URL returned nothing for every account
   // while the comparison below was already normalizing. Both sides must use the same form.
   const expectedDomain = normalizeDomain(account.website);
-  const payload = await callTool(client, "search_companies", { companyWebsite: expectedDomain, pageSize: 10, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
+  // An exact-domain lookup needs one record; a smaller page keeps the response well under
+  // any response size cap while leaving room for subsidiaries sharing the domain.
+  const payload = await callTool(client, "search_companies", { companyWebsite: expectedDomain, pageSize: 5, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
   const records = findRecords(payload, ["companies", "results", "data", "records"]);
   const matches = records.filter((record) => recordDomains(record).includes(expectedDomain));
   if (matches.length !== 1) {
