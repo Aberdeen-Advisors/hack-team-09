@@ -372,11 +372,18 @@ function resultText(result: UnknownRecord): string {
   return content.map((item) => asRecord(item)?.text).filter((value): value is string => typeof value === "string").join("\n");
 }
 
+// ZoomInfo returns structuredContent as a JSON string rather than a decoded object, so
+// passing it through left every consumer holding text where it expected records.
+function decodeJson(value: unknown): unknown {
+  if (typeof value !== "string" || !value.trim()) return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
 function extractToolPayload(result: unknown): unknown {
   const record = asRecord(result);
-  if (!record) return result;
+  if (!record) return decodeJson(result);
   if (record.isError) throw new Error(resultText(record) || "ZoomInfo MCP tool returned an error");
-  if (record.structuredContent !== undefined) return record.structuredContent;
+  if (record.structuredContent !== undefined) return decodeJson(record.structuredContent);
   const text = resultText(record);
   if (!text) return record;
   try { return JSON.parse(text); } catch { return { text }; }
@@ -472,9 +479,11 @@ async function resolveCompany(client: Client, account: Account): Promise<{ compa
     // Without the domains ZoomInfo actually returned there is no way to tell an empty
     // result apart from a response this code failed to parse.
     const observed = [...new Set(records.flatMap(recordDomains))].slice(0, 5);
+    // Naming the fields that were present turns an unknown domain key into a fact.
+    const fields = [...new Set(records.flatMap((record) => Object.keys(record)))].slice(0, 20).join(", ");
     const seen = records.length === 0
       ? `the search returned no readable records (${payloadPreview(payload)})`
-      : `the search returned ${records.length} record(s) with domains ${observed.length ? observed.join(", ") : "that could not be read"}`;
+      : `the search returned ${records.length} record(s) with ${observed.length ? `domains ${observed.join(", ")}` : `no readable domain; fields present: ${fields}`}`;
     throw new Error(matches.length ? `ZoomInfo returned ${matches.length} exact domain matches for ${expectedDomain}` : `No exact ZoomInfo domain match for ${expectedDomain}; ${seen}`);
   }
   const companyId = stringValue(matches[0], ["companyId", "zoominfoCompanyId", "ziCompanyId", "id"]);
@@ -746,4 +755,4 @@ export function resetZoomInfoStateForTests(): void {
   toolQueue = Promise.resolve();
 }
 
-export const zoomInfoInternalsForTests = { callTool, isRateLimited };
+export const zoomInfoInternalsForTests = { callTool, isRateLimited, extractToolPayload, findRecords };

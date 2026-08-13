@@ -79,6 +79,39 @@ describe("ZoomInfo MCP normalization", () => {
   });
 });
 
+describe("ZoomInfo response decoding", () => {
+  // Shape observed from the live ZoomInfo MCP server: JSON:API records nested under
+  // data[].attributes, with structuredContent delivered as a string rather than an object.
+  const companies = { data: [{ id: "345", attributes: { name: "DraftKings", city: "Boston", employeeCount: "5500", website: "https://www.draftkings.com" } }] };
+
+  it("decodes structuredContent delivered as a JSON string", () => {
+    const payload = zoomInfoInternalsForTests.extractToolPayload({ structuredContent: JSON.stringify(companies) });
+    expect(payload).toEqual(companies);
+  });
+
+  it("leaves an already-decoded structuredContent object untouched", () => {
+    expect(zoomInfoInternalsForTests.extractToolPayload({ structuredContent: companies })).toEqual(companies);
+  });
+
+  it("keeps non-JSON text as text rather than discarding it", () => {
+    expect(zoomInfoInternalsForTests.extractToolPayload({ structuredContent: "not json at all" })).toBe("not json at all");
+  });
+
+  it("flattens attributes and resolves the company domain and id", () => {
+    const payload = zoomInfoInternalsForTests.extractToolPayload({ structuredContent: JSON.stringify(companies) });
+    const records = zoomInfoInternalsForTests.findRecords(payload, ["companies", "results", "data", "records"]);
+
+    expect(records).toHaveLength(1);
+    expect(recordDomains(records[0])).toContain("draftkings.com");
+    expect(records[0].id).toBe("345");
+    expect(records[0].name).toBe("DraftKings");
+  });
+
+  it("still surfaces a tool error instead of decoding it", () => {
+    expect(() => zoomInfoInternalsForTests.extractToolPayload({ isError: true, content: [{ type: "text", text: "quota exceeded" }] })).toThrow("quota exceeded");
+  });
+});
+
 describe("ZoomInfo rate limit handling", () => {
   const rateLimit = new Error('Error POSTing to endpoint: {"errors":[{"code":"ZI0004","detail":"Too many requests. Please retry after 1 second.","title":"Rate limit exceeded"}]}');
 
