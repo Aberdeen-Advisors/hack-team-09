@@ -61,7 +61,7 @@ describe("workspace navigation", () => {
     render(<Dashboard initialDetails={details} initialStatus={disconnectedStatus} metrics={{ rows: 20, canonicalAccounts: 19, pursueNow: 2 }} initialStage="prioritize" />);
 
     expect(screen.getByRole("button", { name: "Connect ZoomInfo to refresh" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Open integration diagnostics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
     expect(screen.getByRole("button", { name: "Connect ZoomInfo" })).toBeEnabled();
   });
 
@@ -69,8 +69,12 @@ describe("workspace navigation", () => {
     const details = listAccountDetails();
     render(<Dashboard initialDetails={details} initialStatus={{ ...status, admin: { authenticated: false, configured: true } }} metrics={{ rows: 20, canonicalAccounts: 19, pursueNow: 2 }} initialStage="prioritize" />);
     expect(screen.getByRole("button", { name: "Admin sign in to refresh" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Open integration diagnostics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
     expect(screen.getByLabelText("Administrator password")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Administrator password")).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Unlock connection controls" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Administrator password"), { target: { value: "test-password" } });
+    expect(screen.getByRole("button", { name: "Unlock connection controls" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Connect ZoomInfo" })).not.toBeInTheDocument();
   });
 });

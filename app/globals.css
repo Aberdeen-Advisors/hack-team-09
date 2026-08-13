@@ -28,8 +28,8 @@ button:focus-visible,a:focus-visible,select:focus-visible,textarea:focus-visible
 .queue-title-row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin:5px 0 13px; }
 .queue-title-row h2 { color:var(--aberdeen-blue); font-size:20px; margin:0; }
 .queue-title-row span { color:var(--onyx); font-size:11px; }
-.refresh-button,.primary-button,.secondary-button,.icon-button { border:0; border-radius:5px; cursor:pointer; font-weight:600; transition:transform .14s ease,box-shadow .14s ease,background .14s ease; }
-.refresh-button:hover,.primary-button:hover,.secondary-button:hover,.icon-button:hover { transform:translateY(-1px); }
+.refresh-button,.primary-button,.secondary-button,.icon-button,.integration-button { border:0; border-radius:5px; cursor:pointer; font-weight:600; transition:transform .14s ease,box-shadow .14s ease,background .14s ease; }
+.refresh-button:hover,.primary-button:hover,.secondary-button:hover,.icon-button:hover,.integration-button:hover { transform:translateY(-1px); }
 .refresh-button { width:100%; background:var(--aberdeen-blue); color:white; padding:10px 14px; display:flex; align-items:center; justify-content:center; gap:8px; }
 .refresh-button:disabled,.primary-button:disabled { opacity:.62; cursor:wait; transform:none; }
 .filters { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
@@ -121,6 +121,7 @@ button:focus-visible,a:focus-visible,select:focus-visible,textarea:focus-visible
 .drawer-header { display:flex; justify-content:space-between; align-items:center; }
 .drawer h2 { color:var(--aberdeen-blue); margin:0; font-size:21px; }
 .icon-button { width:36px; height:36px; display:grid; place-items:center; background:#edf3f6; color:var(--aberdeen-blue); }
+.integration-button { min-height:36px; padding:8px 12px; display:flex; align-items:center; gap:7px; background:var(--aberdeen-teal); color:var(--aberdeen-blue-dark); white-space:nowrap; }
 .diagnostic { margin-top:13px; padding:14px; border:1px solid var(--line); border-radius:5px; }
 .diagnostic-top { display:flex; justify-content:space-between; gap:10px; }
 .diagnostic strong { color:var(--aberdeen-blue); font-size:13px; }
@@ -130,6 +131,7 @@ button:focus-visible,a:focus-visible,select:focus-visible,textarea:focus-visible
 .admin-form p { margin:0; font-size:10px; line-height:1.5; }
 .admin-form label { color:var(--onyx); font-size:10px; font-weight:600; }
 .admin-form input { width:100%; border:1px solid #b9cad4; border-radius:4px; padding:10px; color:var(--aberdeen-blue); }
+.admin-hint { color:#687a85; font-size:9px; line-height:1.4; }
 .admin-session { margin-top:14px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
 .empty-state { background:white; padding:28px; border:1px solid var(--line); text-align:center; border-radius:7px; color:#687a85; }
 .spin { animation:spin 1s linear infinite; }
