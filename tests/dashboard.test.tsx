@@ -11,7 +11,6 @@ vi.mock("next/image", () => ({
 
 const status: IntegrationStatus = {
   demoMode: true,
-  admin: { authenticated: true, configured: true },
   diagnostics: [
     { provider: "OpenAI", mode: "mock", status: "ready", configured: false, message: "Deterministic mock active.", checkedAt: "2026-08-13T12:00:00.000Z" },
     { provider: "ZoomInfo", mode: "mock", status: "ready", configured: false, message: "Seeded signals active.", checkedAt: "2026-08-13T12:00:00.000Z" },
@@ -63,18 +62,5 @@ describe("workspace navigation", () => {
     expect(screen.getByRole("button", { name: "Connect ZoomInfo to refresh" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
     expect(screen.getByRole("button", { name: "Connect ZoomInfo" })).toBeEnabled();
-  });
-
-  it("keeps ZoomInfo mutations read-only until an administrator signs in", () => {
-    const details = listAccountDetails();
-    render(<Dashboard initialDetails={details} initialStatus={{ ...status, admin: { authenticated: false, configured: true } }} metrics={{ rows: 20, canonicalAccounts: 19, pursueNow: 2 }} initialStage="prioritize" />);
-    expect(screen.getByRole("button", { name: "Admin sign in to refresh" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
-    expect(screen.getByLabelText("Administrator password")).toHaveAttribute("type", "password");
-    expect(screen.getByLabelText("Administrator password")).toHaveFocus();
-    expect(screen.getByRole("button", { name: "Unlock connection controls" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Administrator password"), { target: { value: "test-password" } });
-    expect(screen.getByRole("button", { name: "Unlock connection controls" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: "Connect ZoomInfo" })).not.toBeInTheDocument();
   });
 });

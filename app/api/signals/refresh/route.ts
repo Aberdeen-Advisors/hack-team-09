@@ -1,13 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { accounts } from "@/lib/data";
-import { isAdminRequest, validRequestOrigin } from "@/lib/admin-auth";
+import { validRequestOrigin } from "@/lib/admin-auth";
 import { integrationStatus, providers } from "@/lib/providers";
 import { accountMetrics, listAccountDetails } from "@/lib/repository";
 import { refreshZoomInfoAccounts, ZoomInfoRefreshInProgressError, zoomInfoIntegrationSnapshot, zoomInfoMode } from "@/lib/zoominfo-mcp";
 
 export async function POST(request: NextRequest) {
   if (!validRequestOrigin(request)) return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
-  if (!isAdminRequest(request)) return NextResponse.json({ error: "Administrator sign-in required" }, { status: 401 });
   if (zoomInfoMode() === "mcp") {
     const before = await zoomInfoIntegrationSnapshot(true);
     if (before.state !== "ready") return NextResponse.json({ error: before.error || "Connect ZoomInfo before refreshing live signals", status: await integrationStatus(true) }, { status: 409 });

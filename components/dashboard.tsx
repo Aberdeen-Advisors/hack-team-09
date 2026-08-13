@@ -28,8 +28,7 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const [drafts, setDrafts] = useState<Record<string, OutreachDraft>>({});
   const [draftBodies, setDraftBodies] = useState<Record<string, string>>({});
   const [generating, setGenerating] = useState(false);
-  const [adminPassword, setAdminPassword] = useState("");
-  const [adminBusy, setAdminBusy] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const selected = details.find((item) => item.account.id === selectedId) ?? details[0];
@@ -82,38 +81,13 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   }
 
   async function connectZoomInfo() {
-    setAdminBusy(true);
+    setConnecting(true);
     try {
       const response = await fetch("/api/integrations/zoominfo/connect", { method: "POST" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Unable to connect ZoomInfo");
       window.location.assign(payload.authorizationUrl);
-    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to connect ZoomInfo"); setAdminBusy(false); }
-  }
-
-  async function signInAdmin(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setAdminBusy(true);
-    try {
-      const response = await fetch("/api/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: adminPassword }) });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Administrator sign-in failed");
-      setAdminPassword("");
-      await refreshStatus();
-      setToast("Administrator controls unlocked.");
-    } catch (error) { setToast(error instanceof Error ? error.message : "Administrator sign-in failed"); }
-    finally { setAdminBusy(false); }
-  }
-
-  async function signOutAdmin() {
-    setAdminBusy(true);
-    try {
-      const response = await fetch("/api/admin/logout", { method: "POST" });
-      if (!response.ok) throw new Error("Unable to sign out");
-      await refreshStatus();
-      setToast("Administrator signed out.");
-    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to sign out"); }
-    finally { setAdminBusy(false); }
+    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to connect ZoomInfo"); setConnecting(false); }
   }
 
   async function disconnectZoomInfo() {
@@ -148,7 +122,6 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const warm = selected.account.buyers.find((buyer) => buyer.warmth === "Warm");
   const recommendation = selected.recommendation;
   const zoomInfoNeedsConnection = status.zoomInfo && !["mock", "ready"].includes(status.zoomInfo.state);
-  const isAdmin = status.admin.authenticated;
   const integrationActionLabel = zoomInfoNeedsConnection ? "Set up ZoomInfo" : "Integration settings";
 
   return <div className="app-shell">
@@ -160,7 +133,7 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
     <div className="workspace">
       <aside className={`queue-panel ${mobileDetail ? "mobile-hidden" : ""}`} aria-label="Account queue">
         <div className="queue-header"><div className="eyebrow">Signal queue</div><div className="queue-title-row"><h2>Who to call today</h2><span>{workspaceMetrics.canonicalAccounts} companies · {workspaceMetrics.rows} rows</span></div>
-          <button className="refresh-button" onClick={refreshSignals} disabled={refreshing || !isAdmin || Boolean(zoomInfoNeedsConnection)}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : !isAdmin ? "Admin sign in to refresh" : zoomInfoNeedsConnection ? "Connect ZoomInfo to refresh" : "Refresh signals"}</button>
+          <button className="refresh-button" onClick={refreshSignals} disabled={refreshing || Boolean(zoomInfoNeedsConnection)}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : zoomInfoNeedsConnection ? "Connect ZoomInfo to refresh" : "Refresh signals"}</button>
           <div className="filters"><select aria-label="Sort account queue" value={sort} onChange={(e) => setSort(e.target.value)}><option value="score">Highest score</option><option value="company">Company A-Z</option></select><select aria-label="Filter by industry" value={industry} onChange={(e) => setIndustry(e.target.value)}><option value="all">All industries</option>{industries.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by signal type" value={signalType} onChange={(e) => setSignalType(e.target.value)}><option value="all">All signals</option>{signalTypes.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by relationship" value={warmOnly ? "warm" : "all"} onChange={(e) => setWarmOnly(e.target.value === "warm")}><option value="all">All relationships</option><option value="warm">Warm only</option></select></div>
           <p className="refresh-note">Ranked by explainable ICP fit. Unknown evidence earns zero points.</p>
         </div>
@@ -178,7 +151,7 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
         </section>
       </main>
     </div>
-    {drawerOpen && <><div className="drawer-backdrop" onClick={() => setDrawerOpen(false)} /><aside className="drawer" aria-label="Integration diagnostics"><div className="drawer-header"><div><div className="eyebrow">ZoomInfo setup</div><h2>Integration status</h2></div><button className="icon-button" aria-label="Close diagnostics" onClick={() => setDrawerOpen(false)}><X size={18} /></button></div><p style={{ fontSize: 11, lineHeight: 1.6 }}>ZoomInfo credentials and encrypted OAuth tokens remain server-side. Once connected, ZoomInfo remains connected through its stored refresh token; administrator sign-in only unlocks connection and refresh controls.</p>{!isAdmin ? <form className="admin-form" onSubmit={signInAdmin}><strong>Unlock ZoomInfo controls</strong><p>Enter the administrator password below. After sign-in, the Connect ZoomInfo button will appear in this panel.</p><label htmlFor="admin-password">Administrator password</label><input id="admin-password" type="password" autoComplete="current-password" autoFocus value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} disabled={adminBusy || !status.admin.configured} /><button className="primary-button" type="submit" disabled={adminBusy || !adminPassword || !status.admin.configured}>{adminBusy ? "Signing in..." : "Unlock connection controls"}</button>{!adminPassword && status.admin.configured && <span className="admin-hint">Enter your password to enable the sign-in button.</span>}{!status.admin.configured && <div className="callout-warning">Administrator access is not configured on this deployment.</div>}</form> : <div className="admin-session"><span className="badge warm">Administrator controls unlocked</span><button className="secondary-button" onClick={signOutAdmin} disabled={adminBusy}>Sign out</button></div>}{status.zoomInfo && <div className="diagnostic"><div className="diagnostic-top"><strong>ZoomInfo MCP connection</strong><span className={`badge ${status.zoomInfo.state === "ready" ? "warm" : "indirect"}`}>{status.zoomInfo.state}</span></div><p>{status.zoomInfo.liveAccounts} of {status.zoomInfo.totalCanonicalAccounts} canonical accounts currently use live ZoomInfo signals.</p>{status.zoomInfo.lastSuccessfulRefreshAt && <div className="source-line">Last live refresh {new Date(status.zoomInfo.lastSuccessfulRefreshAt).toLocaleString()}</div>}{isAdmin && <div style={{ display: "flex", gap: 8, marginTop: 12 }}>{status.zoomInfo.state === "ready" ? <button className="secondary-button" onClick={disconnectZoomInfo}>Disconnect ZoomInfo</button> : status.zoomInfo.state !== "mock" && <button className="primary-button" onClick={connectZoomInfo} disabled={adminBusy}>Connect ZoomInfo</button>}</div>}</div>}{status.diagnostics.map((item) => <div className="diagnostic" key={item.provider}><div className="diagnostic-top"><strong>{item.provider}</strong><span className={`badge ${item.configured ? "warm" : "indirect"}`}>{item.mode}</span></div><p>{item.message}</p>{isAdmin && <div className="source-line">Configuration {item.configured ? "present" : "missing"} · {item.status}</div>}</div>)}</aside></>}
+    {drawerOpen && <><div className="drawer-backdrop" onClick={() => setDrawerOpen(false)} /><aside className="drawer" aria-label="Integration diagnostics"><div className="drawer-header"><div><div className="eyebrow">ZoomInfo setup</div><h2>Integration status</h2></div><button className="icon-button" aria-label="Close diagnostics" onClick={() => setDrawerOpen(false)}><X size={18} /></button></div><p style={{ fontSize: 11, lineHeight: 1.6 }}>ZoomInfo credentials and encrypted OAuth tokens remain server-side. Once connected, ZoomInfo remains connected through its stored refresh token.</p>{status.zoomInfo && <div className="diagnostic"><div className="diagnostic-top"><strong>ZoomInfo MCP connection</strong><span className={`badge ${status.zoomInfo.state === "ready" ? "warm" : "indirect"}`}>{status.zoomInfo.state}</span></div><p>{status.zoomInfo.liveAccounts} of {status.zoomInfo.totalCanonicalAccounts} canonical accounts currently use live ZoomInfo signals.</p>{status.zoomInfo.lastSuccessfulRefreshAt && <div className="source-line">Last live refresh {new Date(status.zoomInfo.lastSuccessfulRefreshAt).toLocaleString()}</div>}<div style={{ display: "flex", gap: 8, marginTop: 12 }}>{status.zoomInfo.state === "ready" ? <button className="secondary-button" onClick={disconnectZoomInfo}>Disconnect ZoomInfo</button> : status.zoomInfo.state !== "mock" && <button className="primary-button" onClick={connectZoomInfo} disabled={connecting}>Connect ZoomInfo</button>}</div></div>}{status.diagnostics.map((item) => <div className="diagnostic" key={item.provider}><div className="diagnostic-top"><strong>{item.provider}</strong><span className={`badge ${item.configured ? "warm" : "indirect"}`}>{item.mode}</span></div><p>{item.message}</p><div className="source-line">Configuration {item.configured ? "present" : "missing"} · {item.status}</div></div>)}</aside></>}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }

@@ -163,7 +163,6 @@ export type ProviderDiagnostic = z.infer<typeof providerDiagnosticSchema>;
 
 export const integrationStatusSchema = z.object({
   demoMode: z.boolean(),
-  admin: z.object({ authenticated: z.boolean(), configured: z.boolean() }),
   diagnostics: z.array(providerDiagnosticSchema),
   zoomInfo: z.object({
     state: z.enum(["disabled", "mock", "disconnected", "authorizing", "ready", "error"]),

@@ -24,13 +24,4 @@ describe("shared persistence contract", () => {
     await persistence.releaseLock("refresh", "owner-a");
     expect(await persistence.acquireLock("refresh", "owner-b", 60)).toBe(true);
   });
-
-  it("tracks and clears login failures", async () => {
-    const persistence = appPersistence();
-    expect(await persistence.recordLoginFailure("client", 900)).toBe(1);
-    expect(await persistence.recordLoginFailure("client", 900)).toBe(2);
-    expect(await persistence.getLoginFailures("client")).toBe(2);
-    await persistence.clearLoginFailures("client");
-    expect(await persistence.getLoginFailures("client")).toBe(0);
-  });
 });

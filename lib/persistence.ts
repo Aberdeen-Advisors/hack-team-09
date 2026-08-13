@@ -44,9 +44,6 @@ export interface AppPersistence {
   clearCompanyCache(canonicalCompanyIds: string[]): Promise<void>;
   acquireLock(name: string, owner: string, ttlSeconds: number): Promise<boolean>;
   releaseLock(name: string, owner: string): Promise<void>;
-  getLoginFailures(clientKey: string): Promise<number>;
-  recordLoginFailure(clientKey: string, ttlSeconds: number): Promise<number>;
-  clearLoginFailures(clientKey: string): Promise<void>;
 }
 
 const DEFAULT_META: ZoomInfoMeta = { requiredToolsReady: false, discoveredTools: [] };
@@ -58,7 +55,6 @@ type MemoryState = {
   meta: ZoomInfoMeta;
   cache: Map<string, { value: StoredCompanyCache; expiresAt: number }>;
   locks: Map<string, { owner: string; expiresAt: number }>;
-  failures: Map<string, { count: number; expiresAt: number }>;
 };
 
 declare global {
@@ -74,7 +70,6 @@ function memoryState(): MemoryState {
       meta: { ...DEFAULT_META },
       cache: new Map(),
       locks: new Map(),
-      failures: new Map(),
     };
   }
   return globalThis.__signalOutreachPersistence;
@@ -116,17 +111,6 @@ class MemoryPersistence implements AppPersistence {
     return true;
   }
   async releaseLock(name: string, owner: string) { if (memoryState().locks.get(name)?.owner === owner) memoryState().locks.delete(name); }
-  async getLoginFailures(key: string) {
-    const entry = memoryState().failures.get(key);
-    if (!entry || entry.expiresAt <= Date.now()) { memoryState().failures.delete(key); return 0; }
-    return entry.count;
-  }
-  async recordLoginFailure(key: string, ttlSeconds: number) {
-    const count = await this.getLoginFailures(key) + 1;
-    memoryState().failures.set(key, { count, expiresAt: Date.now() + ttlSeconds * 1000 });
-    return count;
-  }
-  async clearLoginFailures(key: string) { memoryState().failures.delete(key); }
 }
 
 class RedisPersistence implements AppPersistence {
@@ -135,8 +119,6 @@ class RedisPersistence implements AppPersistence {
   private key(suffix: string) { return `${this.prefix}:${suffix}`; }
   private pendingKey(state: string) { return this.key(`oauth:pending:${state}`); }
   private cacheKey(id: string) { return this.key(`zoominfo:cache:${id}`); }
-  private failureKey(id: string) { return this.key(`admin:failures:${id}`); }
-
   async loadAccounts() { return this.redis.get<Account[]>(this.key("accounts")); }
   async saveAccounts(accounts: Account[]) { await this.redis.set(this.key("accounts"), accounts); }
   async createPendingOAuth(record: PendingOAuth, ttlSeconds: number) { await this.redis.set(this.pendingKey(record.state), record, { ex: ttlSeconds }); }
@@ -159,14 +141,6 @@ class RedisPersistence implements AppPersistence {
   async releaseLock(name: string, owner: string) {
     await this.redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", [this.key(`lock:${name}`)], [owner]);
   }
-  async getLoginFailures(id: string) { return Number(await this.redis.get<number>(this.failureKey(id)) ?? 0); }
-  async recordLoginFailure(id: string, ttlSeconds: number) {
-    const key = this.failureKey(id);
-    const count = await this.redis.incr(key);
-    if (count === 1) await this.redis.expire(key, ttlSeconds);
-    return count;
-  }
-  async clearLoginFailures(id: string) { await this.redis.del(this.failureKey(id)); }
 }
 
 function redisEnvironment(): { url: string; token: string } | null {

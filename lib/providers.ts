@@ -12,7 +12,6 @@ import {
   type OutreachDraft,
   type Signal,
 } from "@/lib/schemas";
-import { adminConfigurationError } from "@/lib/admin-auth";
 import { zoomInfoIntegrationSnapshot, zoomInfoMode } from "@/lib/zoominfo-mcp";
 
 export interface SignalProvider {
@@ -159,7 +158,6 @@ export async function integrationStatus(admin = false): Promise<IntegrationStatu
       { provider: "Slack", mode: "mock", configured: false, status: "not-configured", message: "Preview only; no messages are sent.", checkedAt },
     ],
     zoomInfo,
-    admin: { authenticated: admin, configured: !adminConfigurationError() },
   };
 }
 

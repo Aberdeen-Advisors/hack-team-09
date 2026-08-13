@@ -12,8 +12,6 @@ export default defineConfig({
     command: "npm run dev -- -H 127.0.0.1 -p 4317",
     env: {
       ...process.env,
-      ADMIN_PASSWORD: "e2e-admin-password",
-      ADMIN_SESSION_SECRET: "e2e-session-secret-with-more-than-32-characters",
       ZOOMINFO_PROVIDER: "mock",
     },
     url: "http://127.0.0.1:4317",

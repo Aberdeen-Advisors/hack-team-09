@@ -7,10 +7,7 @@ test("laptop demo journey reaches outreach in two guided advances", async ({ pag
 
   await expect(page.getByRole("heading", { name: "Who to call today" })).toBeVisible();
   await expect(page.getByRole("tab", { name: /Prioritize/ })).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("button", { name: "Open integration diagnostics" }).click();
-  await page.getByLabel("Administrator password").fill("e2e-admin-password");
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page.getByText("Administrator", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Open ZoomInfo setup" }).click();
   await page.getByRole("button", { name: "Close diagnostics" }).click();
   await page.getByRole("button", { name: "Refresh signals" }).click();
   await expect(page.getByRole("status")).toContainText("accounts refreshed");
