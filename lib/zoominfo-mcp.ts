@@ -124,7 +124,11 @@ class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
 }
 
 function newTransport(provider = new DurableZoomInfoOAuthProvider(appPersistence())): StreamableHTTPClientTransport {
-  return new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider, onInsufficientScope: "throw" });
+  // ZoomInfo's oauth-authorization-server metadata echoes Okta's issuer
+  // (https://okta-login.zoominfo.com/oauth2/default) instead of their own MCP
+  // domain, which fails the RFC 8414 §3.3 issuer check. Known ZoomInfo-side
+  // misconfiguration; skip the check until they fix it.
+  return new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider, onInsufficientScope: "throw", skipIssuerMetadataValidation: true });
 }
 
 function newClient(): Client {
