@@ -88,7 +88,10 @@ class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
 
   clientInformation(): StoredOAuthClientInformation {
     const { clientId, clientSecret } = clientCredentials();
-    return { client_id: clientId, client_secret: clientSecret };
+    // Without this, the SDK ignores our intended auth method and auto-selects
+    // client_secret_basic whenever ZoomInfo's Okta discovery metadata lists it
+    // as supported, which ZoomInfo then rejects as an invalid client secret.
+    return { client_id: clientId, client_secret: clientSecret, token_endpoint_auth_method: "client_secret_post" };
   }
 
   async tokens(): Promise<StoredOAuthTokens | undefined> {
