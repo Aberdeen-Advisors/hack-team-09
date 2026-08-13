@@ -1,0 +1,577 @@
+import { randomUUID } from "node:crypto";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  UnauthorizedError,
+  type OAuthClientMetadata,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+  type StoredOAuthClientInformation,
+  type StoredOAuthTokens,
+} from "@modelcontextprotocol/client";
+import { accountSchema, buyerSchema, signalSchema, type Account, type Buyer, type Signal } from "@/lib/schemas";
+import { appPersistence, redisConfigured, resetPersistenceForTests, type AppPersistence, type PendingOAuth } from "@/lib/persistence";
+import { scoreAccount } from "@/lib/scoring";
+import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate } from "@/lib/session-store";
+import { decryptOAuthTokens, encryptOAuthTokens, tokenEncryptionConfigured } from "@/lib/token-crypto";
+
+const REQUIRED_TOOLS = ["lookup", "search_companies", "enrich_intent", "enrich_scoops", "get_recommended_contacts", "search_contacts"] as const;
+const DEFAULT_TOPIC_QUERIES = ["artificial intelligence", "generative AI", "digital transformation", "cloud migration", "data analytics"];
+const RELEVANT_SCOOP_TYPES = ["Funding", "Mergers & Acquisitions (M&A)", "New Hire", "Promotion", "Management Move", "Executive Move", "Project", "Pain Point", "Partnership", "Product Launch", "Facilities Relocation / Expansion"];
+
+type UnknownRecord = Record<string, unknown>;
+const OAUTH_PENDING_TTL_SECONDS = 600;
+const REFRESH_LOCK_TTL_SECONDS = 180;
+
+export function zoomInfoMode(): "mock" | "mcp" {
+  return process.env.ZOOMINFO_PROVIDER?.toLowerCase() === "mcp" ? "mcp" : "mock";
+}
+
+function mcpUrl(): URL {
+  return new URL(process.env.ZOOMINFO_MCP_URL || "https://mcp.zoominfo.com/mcp");
+}
+
+function redirectUri(): string {
+  return process.env.ZOOMINFO_MCP_REDIRECT_URI || "http://localhost:3000/api/integrations/zoominfo/callback";
+}
+
+function clientCredentials(): { clientId: string; clientSecret: string } {
+  const clientId = process.env.ZOOMINFO_MCP_CLIENT_ID;
+  const clientSecret = process.env.ZOOMINFO_MCP_CLIENT_SECRET;
+  if (!clientId || !clientSecret) throw new Error("ZoomInfo MCP client ID and secret are not configured");
+  return { clientId, clientSecret };
+}
+
+function configurationError(): string | undefined {
+  if (zoomInfoMode() !== "mcp") return undefined;
+  if (!process.env.ZOOMINFO_MCP_CLIENT_ID || !process.env.ZOOMINFO_MCP_CLIENT_SECRET) return "ZoomInfo MCP client ID and secret are not configured.";
+  if (!tokenEncryptionConfigured()) return "ZOOMINFO_TOKEN_ENCRYPTION_KEY is missing or invalid.";
+  if (process.env.NODE_ENV === "production" && !redisConfigured()) return "Upstash Redis is required for ZoomInfo MCP in production.";
+  return undefined;
+}
+
+export function zoomInfoOAuthEnabled(): boolean {
+  return zoomInfoMode() === "mcp" && !configurationError();
+}
+
+function friendlyError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]").slice(0, 400);
+}
+
+class DurableZoomInfoOAuthProvider implements OAuthClientProvider {
+  private flowState?: string;
+
+  constructor(private readonly persistence: AppPersistence, private readonly consumedPending?: PendingOAuth) {
+    this.flowState = consumedPending?.state;
+  }
+
+  get currentState(): string | undefined { return this.flowState; }
+  get redirectUrl(): string { return redirectUri(); }
+
+  get clientMetadata(): OAuthClientMetadata {
+    return {
+      client_name: "Aberdeen Signal-to-Outreach",
+      redirect_uris: [redirectUri()],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "client_secret_post",
+    };
+  }
+
+  async state(): Promise<string> {
+    if (this.flowState) return this.flowState;
+    this.flowState = randomUUID();
+    await this.persistence.createPendingOAuth({ state: this.flowState, createdAt: new Date().toISOString() }, OAUTH_PENDING_TTL_SECONDS);
+    return this.flowState;
+  }
+
+  clientInformation(): StoredOAuthClientInformation {
+    const { clientId, clientSecret } = clientCredentials();
+    return { client_id: clientId, client_secret: clientSecret };
+  }
+
+  async tokens(): Promise<StoredOAuthTokens | undefined> {
+    const blob = await this.persistence.getTokenBlob();
+    return blob ? decryptOAuthTokens(blob) : undefined;
+  }
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> { await this.persistence.saveTokenBlob(encryptOAuthTokens(tokens)); }
+  async redirectToAuthorization(url: URL): Promise<void> {
+    if (!this.flowState) throw new Error("ZoomInfo OAuth state was not initialized");
+    await this.persistence.updatePendingOAuth(this.flowState, { authorizationUrl: url.toString() }, OAUTH_PENDING_TTL_SECONDS);
+  }
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    if (!this.flowState) throw new Error("ZoomInfo OAuth state was not initialized");
+    await this.persistence.updatePendingOAuth(this.flowState, { codeVerifier }, OAUTH_PENDING_TTL_SECONDS);
+  }
+  async codeVerifier(): Promise<string> {
+    const pending = this.consumedPending ?? (this.flowState ? await this.persistence.getPendingOAuth(this.flowState) : null);
+    const codeVerifier = pending?.codeVerifier;
+    if (!codeVerifier) throw new Error("ZoomInfo OAuth code verifier is missing; reconnect ZoomInfo");
+    return codeVerifier;
+  }
+  async saveDiscoveryState(discoveryState: OAuthDiscoveryState): Promise<void> {
+    if (!this.flowState) throw new Error("ZoomInfo OAuth state was not initialized");
+    await this.persistence.updatePendingOAuth(this.flowState, { discoveryState }, OAUTH_PENDING_TTL_SECONDS);
+  }
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    const pending = this.consumedPending ?? (this.flowState ? await this.persistence.getPendingOAuth(this.flowState) : null);
+    return pending?.discoveryState;
+  }
+  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    if (scope === "all" || scope === "tokens") await this.persistence.deleteTokenBlob();
+  }
+}
+
+function newTransport(provider = new DurableZoomInfoOAuthProvider(appPersistence())): StreamableHTTPClientTransport {
+  return new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider, onInsufficientScope: "throw" });
+}
+
+function newClient(): Client {
+  return new Client({ name: "signal-to-outreach", version: "0.1.0" }, { versionNegotiation: { mode: "auto" } });
+}
+
+async function connectClient(provider?: DurableZoomInfoOAuthProvider): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
+  const client = newClient();
+  const transport = newTransport(provider);
+  try {
+    await client.connect(transport);
+    return { client, transport };
+  } catch (error) {
+    try { await client.close(); } catch { /* connection was not established */ }
+    throw error;
+  }
+}
+
+async function closeClient(client: Client, transport: StreamableHTTPClientTransport): Promise<void> {
+  try { await transport.terminateSession(); } catch { /* stateless server */ }
+  try { await client.close(); } catch { /* already closed */ }
+}
+
+async function discoverRequiredTools(client: Client): Promise<void> {
+  const listed = await client.listTools();
+  const names = listed.tools.map((tool) => tool.name);
+  const missing = REQUIRED_TOOLS.filter((name) => !names.includes(name));
+  await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0 });
+  if (missing.length) throw new Error(`ZoomInfo account is missing required MCP tools: ${missing.join(", ")}`);
+}
+
+export async function beginZoomInfoAuthorization(): Promise<string> {
+  if (zoomInfoMode() !== "mcp") throw new Error("Set ZOOMINFO_PROVIDER=mcp before connecting ZoomInfo");
+  const configError = configurationError();
+  if (configError) throw new Error(configError);
+  clientCredentials();
+  const persistence = appPersistence();
+  const provider = new DurableZoomInfoOAuthProvider(persistence);
+  await persistence.updateZoomInfoMeta({ error: undefined, authorizationPendingUntil: new Date(Date.now() + OAUTH_PENDING_TTL_SECONDS * 1000).toISOString() });
+  let connection: { client: Client; transport: StreamableHTTPClientTransport } | undefined;
+  try {
+    connection = await connectClient(provider);
+    await discoverRequiredTools(connection.client);
+    return "/?zoominfo=connected";
+  } catch (error) {
+    const state = provider.currentState;
+    const pending = state ? await persistence.getPendingOAuth(state) : null;
+    if (error instanceof UnauthorizedError && pending?.authorizationUrl) return pending.authorizationUrl;
+    await persistence.updateZoomInfoMeta({ error: friendlyError(error), authorizationPendingUntil: undefined });
+    throw error;
+  } finally {
+    if (connection) await closeClient(connection.client, connection.transport);
+  }
+}
+
+export async function completeZoomInfoAuthorization(params: URLSearchParams): Promise<void> {
+  const configError = configurationError();
+  if (configError) throw new Error(configError);
+  const returnedState = params.get("state");
+  if (!returnedState) throw new Error("ZoomInfo OAuth state was missing; reconnect ZoomInfo");
+  const persistence = appPersistence();
+  const pending = await persistence.consumePendingOAuth(returnedState);
+  if (!pending) throw new Error("ZoomInfo OAuth state expired or was already used; reconnect ZoomInfo");
+  if (params.get("error")) {
+    const message = `ZoomInfo authorization failed: ${params.get("error_description") || params.get("error")}`;
+    await persistence.updateZoomInfoMeta({ error: message, authorizationPendingUntil: undefined });
+    throw new Error(message);
+  }
+  const provider = new DurableZoomInfoOAuthProvider(persistence, pending);
+  const transport = newTransport(provider);
+  try { await transport.finishAuth(params); }
+  catch (error) { await persistence.updateZoomInfoMeta({ error: friendlyError(error), authorizationPendingUntil: undefined }); throw error; }
+  finally { try { await transport.close(); } catch { /* transport was not connected */ } }
+  let connection: { client: Client; transport: StreamableHTTPClientTransport } | undefined;
+  try {
+    connection = await connectClient(provider);
+    await discoverRequiredTools(connection.client);
+    await persistence.updateZoomInfoMeta({ error: undefined, authorizationPendingUntil: undefined });
+  } catch (error) {
+    await persistence.updateZoomInfoMeta({ error: friendlyError(error), authorizationPendingUntil: undefined });
+    throw error;
+  } finally {
+    if (connection) await closeClient(connection.client, connection.transport);
+  }
+}
+
+export async function disconnectZoomInfo(): Promise<void> {
+  const persistence = appPersistence();
+  const accounts = await loadAccounts();
+  await Promise.all([
+    persistence.deleteTokenBlob(),
+    persistence.clearCompanyCache([...new Set(accounts.map((account) => account.canonicalCompanyId))]),
+    persistence.updateZoomInfoMeta({ requiredToolsReady: false, discoveredTools: [], authorizationPendingUntil: undefined, error: undefined, cacheExpiresAt: undefined }),
+  ]);
+}
+
+export async function zoomInfoIntegrationSnapshot(admin = false) {
+  const persistence = appPersistence();
+  const [accounts, meta, tokenBlob] = await Promise.all([loadAccounts(), persistence.getZoomInfoMeta(), persistence.getTokenBlob()]);
+  const totalCanonicalAccounts = new Set(accounts.map((account) => account.canonicalCompanyId)).size;
+  const liveAccounts = new Set(accounts.filter((account) => account.signal.source.label === "ZoomInfo licensed signal").map((account) => account.canonicalCompanyId)).size;
+  const configError = configurationError();
+  const configured = zoomInfoMode() === "mock" || !configError;
+  const authorizing = meta.authorizationPendingUntil && Date.parse(meta.authorizationPendingUntil) > Date.now();
+  const connectionState = zoomInfoMode() === "mock" ? "mock" : configError ? "disabled" : meta.error ? "error" : tokenBlob && meta.requiredToolsReady ? "ready" : authorizing ? "authorizing" : "disconnected";
+  return {
+    state: connectionState as "disabled" | "mock" | "disconnected" | "authorizing" | "ready" | "error",
+    configured,
+    requiredToolsReady: admin ? meta.requiredToolsReady : false,
+    liveAccounts,
+    totalCanonicalAccounts,
+    lastSuccessfulRefreshAt: meta.lastSuccessfulRefreshAt,
+    cacheExpiresAt: meta.cacheExpiresAt,
+    error: admin ? meta.error || configError : undefined,
+  };
+}
+
+function asRecord(value: unknown): UnknownRecord | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : undefined;
+}
+
+function flattenRecord(value: unknown): UnknownRecord | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const attributes = asRecord(record.attributes);
+  return attributes ? { ...attributes, id: record.id ?? attributes.id } : record;
+}
+
+function findRecords(value: unknown, preferredKeys: string[]): UnknownRecord[] {
+  if (Array.isArray(value)) return value.map(flattenRecord).filter((item): item is UnknownRecord => Boolean(item));
+  const record = asRecord(value);
+  if (!record) return [];
+  for (const key of preferredKeys) {
+    if (record[key] !== undefined) {
+      const found = findRecords(record[key], preferredKeys);
+      if (found.length) return found;
+    }
+  }
+  for (const nested of Object.values(record)) {
+    if (Array.isArray(nested)) {
+      const found = findRecords(nested, preferredKeys);
+      if (found.length) return found;
+    }
+    if (nested && typeof nested === "object") {
+      const found = findRecords(nested, preferredKeys);
+      if (found.length && found[0] !== nested) return found;
+    }
+  }
+  return [flattenRecord(record)!];
+}
+
+function resultText(result: UnknownRecord): string {
+  const content = Array.isArray(result.content) ? result.content : [];
+  return content.map((item) => asRecord(item)?.text).filter((value): value is string => typeof value === "string").join("\n");
+}
+
+function extractToolPayload(result: unknown): unknown {
+  const record = asRecord(result);
+  if (!record) return result;
+  if (record.isError) throw new Error(resultText(record) || "ZoomInfo MCP tool returned an error");
+  if (record.structuredContent !== undefined) return record.structuredContent;
+  const text = resultText(record);
+  if (!text) return record;
+  try { return JSON.parse(text); } catch { return { text }; }
+}
+
+async function callTool(client: Client, name: string, args: UnknownRecord): Promise<unknown> {
+  const timeout = Number(process.env.ZOOMINFO_MCP_TIMEOUT_MS || 30000);
+  const result = await client.callTool({ name, arguments: args }, { signal: AbortSignal.timeout(timeout) });
+  return extractToolPayload(result as unknown);
+}
+
+function stringValue(record: UnknownRecord, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number") return String(value);
+  }
+  return undefined;
+}
+
+function numberValue(record: UnknownRecord, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = Number(record[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function normalizeDomain(value: string): string {
+  try { return new URL(value.includes("://") ? value : `https://${value}`).hostname.replace(/^www\./, "").toLowerCase(); }
+  catch { return value.replace(/^www\./, "").replace(/\/$/, "").toLowerCase(); }
+}
+
+function recordDomain(record: UnknownRecord): string | undefined {
+  const direct = stringValue(record, ["website", "companyWebsite", "domain", "url"]);
+  if (direct) return normalizeDomain(direct);
+  const domains = record.domainList;
+  if (Array.isArray(domains) && typeof domains[0] === "string") return normalizeDomain(domains[0]);
+  return undefined;
+}
+
+async function resolveCompany(client: Client, account: Account): Promise<{ companyId: string; record: UnknownRecord }> {
+  const payload = await callTool(client, "search_companies", { companyWebsite: account.website, pageSize: 10, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
+  const records = findRecords(payload, ["companies", "results", "data", "records"]);
+  const expectedDomain = normalizeDomain(account.website);
+  const matches = records.filter((record) => recordDomain(record) === expectedDomain);
+  if (matches.length !== 1) throw new Error(matches.length ? `ZoomInfo returned multiple exact domain matches for ${expectedDomain}` : `No exact ZoomInfo domain match for ${expectedDomain}`);
+  const companyId = stringValue(matches[0], ["companyId", "zoominfoCompanyId", "ziCompanyId", "id"]);
+  if (!companyId) throw new Error(`ZoomInfo company match for ${account.name} did not include a company ID`);
+  return { companyId, record: matches[0] };
+}
+
+function topicQueries(): string[] {
+  return (process.env.ZOOMINFO_INTENT_TOPIC_QUERIES || DEFAULT_TOPIC_QUERIES.join(",")).split(",").map((value) => value.trim()).filter(Boolean).slice(0, 50);
+}
+
+function collectStringArray(value: unknown, key: string): string[] {
+  if (Array.isArray(value)) return value.flatMap((item) => collectStringArray(item, key));
+  const record = asRecord(value);
+  if (!record) return [];
+  const direct = record[key];
+  const directValues = Array.isArray(direct) ? direct.filter((item): item is string => typeof item === "string") : [];
+  return [...directValues, ...Object.values(record).flatMap((nested) => nested && typeof nested === "object" ? collectStringArray(nested, key) : [])];
+}
+
+async function resolveIntentTopics(client: Client): Promise<string[]> {
+  const queries = topicQueries();
+  const payload = await callTool(client, "lookup", { fields: queries.map((fuzzyMatch) => ({ fieldName: "intent-topics", fuzzyMatch })), userIntent: "Resolve approved intent topics for Aberdeen signal monitoring." });
+  const records = findRecords(payload, ["topicDetails", "topics", "results", "data", "records"]);
+  const topics = records.flatMap((record) => {
+    const value = stringValue(record, ["topic", "name", "value", "label"]);
+    return value ? [value] : [];
+  });
+  topics.push(...collectStringArray(payload, "topics"));
+  const unique = [...new Set(topics)].slice(0, 50);
+  if (!unique.length) throw new Error("ZoomInfo lookup returned no valid intent topics for the configured queries");
+  return unique;
+}
+
+type SignalCandidate = { id: string; type: Signal["type"]; summary: string; url?: string; date: string; intentScore: number; relevantIntent: boolean; transformationEvidence: boolean; mergerOrAcquisition: boolean };
+
+function validDate(record: UnknownRecord, keys: string[]): string | undefined {
+  const value = stringValue(record, keys);
+  if (!value || Number.isNaN(Date.parse(value))) return undefined;
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+function intentType(topic: string): Signal["type"] {
+  const normalized = topic.toLowerCase();
+  if (normalized.includes("artificial intelligence") || normalized.includes("generative") || normalized.includes("machine learning")) return "AI intent";
+  if (normalized.includes("cloud") || normalized.includes("modern")) return "Technology modernization";
+  return "Transformation";
+}
+
+function scoopType(value: string): Signal["type"] | undefined {
+  if (value === "Funding") return "Funding";
+  if (value.includes("Acquisition") || value.includes("M&A")) return "M&A";
+  if (["New Hire", "Promotion", "Management Move", "Executive Move"].includes(value)) return "Executive hire";
+  if (["Product Launch", "Facilities Relocation / Expansion", "Project"].includes(value)) return "Technology modernization";
+  if (["Pain Point", "Partnership"].includes(value)) return "Transformation";
+  return undefined;
+}
+
+function whyNow(type: Signal["type"]): string {
+  const messages: Record<Signal["type"], string> = {
+    "AI intent": "Recent research activity indicates an opportunity to validate the priority, sponsor, timing, and smallest measurable AI outcome.",
+    "Executive hire": "A recent leadership change may create a window to validate transformation priorities and the executive mandate.",
+    "M&A": "Current transaction activity may create integration, modernization, and operating-model decisions that warrant timely discovery.",
+    "Transformation": "Recent business activity may signal a transformation priority; confirm the initiative and measurable outcome before advancing.",
+    "Technology modernization": "Recent modernization activity may create a focused opening to connect platform work with measurable adoption and value.",
+    "Funding": "Recent funding may create capacity for prioritized experimentation and a scalable delivery model; confirm allocation and timing.",
+    "No current signal": "No qualifying ZoomInfo trigger was found in the configured lookback window; keep this account in monitoring.",
+  };
+  return messages[type];
+}
+
+export function buildSignalFromToolResults(accountId: string, intentPayload: unknown, scoopsPayload: unknown, now = new Date()): Signal {
+  const intentRecords = findRecords(intentPayload, ["intent", "signals", "results", "data", "records"]);
+  const scoopRecords = findRecords(scoopsPayload, ["scoops", "results", "data", "records"]);
+  const candidates: SignalCandidate[] = [];
+  const lookbackStart = new Date(now);
+  lookbackStart.setUTCDate(lookbackStart.getUTCDate() - Number(process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90));
+  for (const record of intentRecords) {
+    const topic = stringValue(record, ["topic", "topicName", "name"]);
+    const date = validDate(record, ["signalDate", "date", "observedAt"]);
+    const score = numberValue(record, ["signalScore", "score"]) ?? 0;
+    if (!topic || !date || score < 70 || Date.parse(date) < lookbackStart.getTime()) continue;
+    const type = intentType(topic);
+    candidates.push({ id: stringValue(record, ["intentId", "id"]) || `${accountId}-intent-${topic}`, type, summary: `ZoomInfo intent activity for ${topic} (signal score ${score}).`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: score, relevantIntent: true, transformationEvidence: type !== "No current signal", mergerOrAcquisition: false });
+  }
+  for (const record of scoopRecords) {
+    const rawType = stringValue(record, ["scoopType", "type", "category"]);
+    const date = validDate(record, ["originalPublishedDate", "publishedDate", "date"]);
+    const mappedType = rawType ? scoopType(rawType) : undefined;
+    if (!rawType || !date || !mappedType || Date.parse(date) < lookbackStart.getTime()) continue;
+    candidates.push({ id: stringValue(record, ["scoopId", "id"]) || `${accountId}-scoop-${date}`, type: mappedType, summary: stringValue(record, ["description", "summary", "linkText"]) || `ZoomInfo ${rawType} scoop.`, url: stringValue(record, ["link", "url", "sourceUrl"]), date, intentScore: 0, relevantIntent: false, transformationEvidence: ["Transformation", "Technology modernization"].includes(mappedType), mergerOrAcquisition: mappedType === "M&A" });
+  }
+  candidates.sort((a, b) => Date.parse(b.date) - Date.parse(a.date) || b.intentScore - a.intentScore || a.id.localeCompare(b.id));
+  const selected = candidates[0];
+  if (!selected) {
+    return signalSchema.parse({ id: `zoominfo-none-${accountId}-${now.toISOString().slice(0, 10)}`, accountId, type: "No current signal", summary: "No qualifying ZoomInfo intent or scoop was found in the configured lookback window.", whyNow: whyNow("No current signal"), source: { label: "ZoomInfo licensed signal", observedAt: now.toISOString(), provenance: "verified" }, date: now.toISOString().slice(0, 10), relevantIntent: false, activeWithin90Days: false, transformationEvidence: false, mergerOrAcquisition: false });
+  }
+  return signalSchema.parse({ id: selected.id, accountId, type: selected.type, summary: selected.summary, whyNow: whyNow(selected.type), source: { label: "ZoomInfo licensed signal", url: selected.url, observedAt: now.toISOString(), provenance: "verified" }, date: selected.date, relevantIntent: selected.relevantIntent, activeWithin90Days: true, transformationEvidence: selected.transformationEvidence, mergerOrAcquisition: selected.mergerOrAcquisition });
+}
+
+function decisionRoleForTitle(title: string): string {
+  const normalized = title.toLowerCase();
+  if (/chief|c-suite|president/.test(normalized)) return "Likely economic buyer or executive sponsor";
+  if (/vice president|\bvp\b|head of/.test(normalized)) return "Likely executive sponsor or decision-maker";
+  if (/director/.test(normalized)) return "Likely evaluator or functional influencer";
+  return "Potential practitioner or subject-matter influencer";
+}
+
+export function normalizeBuyerFromContact(record: UnknownRecord, personId: string, rank: number, now = new Date()): Buyer | undefined {
+  const name = stringValue(record, ["fullName", "name"]) || [stringValue(record, ["firstName"]), stringValue(record, ["lastName"])].filter(Boolean).join(" ");
+  const title = stringValue(record, ["jobTitle", "title"]);
+  if (!name || !title) return undefined;
+  return buyerSchema.parse({ id: `zoominfo-person-${personId}`, name, title, decisionRole: decisionRoleForTitle(title), decisionRoleProvenance: "inferred", warmth: "Unknown", relationshipSource: "No known Aberdeen relationship; ZoomInfo recommendation only", relationshipProvenance: "unknown", suggestedPath: "Validate relevance and shared context before any outreach; do not treat the recommendation as a relationship.", source: { label: `ZoomInfo recommended contact #${rank}`, observedAt: now.toISOString(), provenance: "verified" } });
+}
+
+async function fetchBuyers(client: Client, companyId: string): Promise<Buyer[]> {
+  const recommendationsPayload = await callTool(client, "get_recommended_contacts", { ziCompanyId: Number(companyId), useCaseType: "PROSPECTING", pageSize: 3 });
+  const recommendations = findRecords(recommendationsPayload, ["recommendations", "results", "data", "records"]).slice(0, 3);
+  const buyers: Buyer[] = [];
+  for (let index = 0; index < recommendations.length; index += 1) {
+    const personId = stringValue(recommendations[index], ["zoominfoContactId", "personId", "contactId", "id"]);
+    if (!personId) continue;
+    const contactPayload = await callTool(client, "search_contacts", { personId, pageSize: 1, userIntent: "Resolve a recommended business contact's name and title only; do not return engagement details." });
+    const contact = findRecords(contactPayload, ["contacts", "results", "data", "records"])[0];
+    if (!contact) continue;
+    const buyer = normalizeBuyerFromContact(contact, personId, index + 1);
+    if (buyer) buyers.push(buyer);
+  }
+  return buyers;
+}
+
+function isoDateDaysAgo(days: number): string {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - days);
+  return date.toISOString().slice(0, 10);
+}
+
+async function refreshOneAccount(client: Client, account: Account, topics: string[]): Promise<ZoomInfoAccountUpdate> {
+  const company = await resolveCompany(client, account);
+  const lookbackDays = Number(process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90);
+  const startDate = isoDateDaysAgo(lookbackDays);
+  const [intentPayload, scoopsPayload, buyers] = await Promise.all([
+    callTool(client, "enrich_intent", { companyId: company.companyId, topics, signalScoreMin: 70, signalStartDate: startDate, sort: "-signalDate", pageSize: 25, userIntent: "Find recent buying intent relevant to Aberdeen AI strategy, product, modernization, and adoption services." }),
+    callTool(client, "enrich_scoops", { zoominfoCompanyIds: [company.companyId], publishedStartDate: startDate, scoopTypes: RELEVANT_SCOOP_TYPES, sort: "-originalPublishedDate", pageSize: 25, userIntent: "Find recent business events that may create a credible consulting outreach trigger." }),
+    fetchBuyers(client, company.companyId),
+  ]);
+  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal: buildSignalFromToolResults(account.id, intentPayload, scoopsPayload), buyers };
+}
+
+function refreshCandidates(items: Account[]): Account[] {
+  const representatives = new Map<string, Account>();
+  for (const account of items) if (!representatives.has(account.canonicalCompanyId) || account.duplicateOf === undefined) representatives.set(account.canonicalCompanyId, account);
+  const limit = Math.max(1, Math.min(19, Number(process.env.ZOOMINFO_REFRESH_ACCOUNT_LIMIT || 5)));
+  return [...representatives.values()].sort((a, b) => scoreAccount(b).total - scoreAccount(a).total || a.name.localeCompare(b.name)).slice(0, limit);
+}
+
+function cacheKey(account: Account, topics: string[]): string {
+  return `${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
+}
+
+export type ZoomInfoRefreshSummary = {
+  selected: number;
+  updated: number;
+  cached: number;
+  unchanged: number;
+  failed: Array<{ accountId: string; accountName: string; message: string }>;
+  estimatedCompanyCredits: number;
+};
+
+export class ZoomInfoRefreshInProgressError extends Error {
+  constructor() { super("A ZoomInfo refresh is already running"); }
+}
+
+export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; summary: ZoomInfoRefreshSummary }> {
+  const snapshot = await zoomInfoIntegrationSnapshot(true);
+  if (zoomInfoMode() !== "mcp") throw new Error("ZoomInfo MCP mode is not enabled");
+  if (snapshot.state !== "ready") throw new Error(snapshot.error || "Connect ZoomInfo before refreshing live signals");
+  const persistence = appPersistence();
+  const lockOwner = randomUUID();
+  if (!await persistence.acquireLock("zoominfo-refresh", lockOwner, REFRESH_LOCK_TTL_SECONDS)) throw new ZoomInfoRefreshInProgressError();
+  let connection: { client: Client; transport: StreamableHTTPClientTransport } | undefined;
+  try {
+    connection = await connectClient();
+    const client = connection.client;
+    await discoverRequiredTools(client);
+    const topics = await resolveIntentTopics(client);
+    const currentAccounts = await loadAccounts();
+    const candidates = refreshCandidates(currentAccounts);
+    const ttlMs = Number(process.env.ZOOMINFO_CACHE_TTL_MINUTES || 1440) * 60_000;
+    const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
+    const updates: ZoomInfoAccountUpdate[] = [];
+    const failures: ZoomInfoRefreshSummary["failed"] = [];
+    const cacheExpirations: number[] = [];
+    let cached = 0;
+    let queried = 0;
+    for (let offset = 0; offset < candidates.length; offset += 2) {
+      const batch = candidates.slice(offset, offset + 2);
+      const results = await Promise.allSettled(batch.map(async (account) => {
+        const key = cacheKey(account, topics);
+        const entry = await persistence.getCompanyCache(account.canonicalCompanyId);
+        if (entry && entry.expiresAt > Date.now() && entry.key === key) return { update: entry.update, cached: true, expiresAt: entry.expiresAt };
+        const update = await refreshOneAccount(client, accountSchema.parse(account), topics);
+        const expiresAt = Date.now() + ttlMs;
+        await persistence.saveCompanyCache(account.canonicalCompanyId, { update, expiresAt, key }, ttlSeconds);
+        return { update, cached: false, expiresAt };
+      }));
+      results.forEach((result, index) => {
+        const account = batch[index];
+        if (result.status === "fulfilled") {
+          updates.push(result.value.update);
+          cacheExpirations.push(result.value.expiresAt);
+          if (result.value.cached) cached += 1; else queried += 1;
+        } else {
+          failures.push({ accountId: account.id, accountName: account.name, message: friendlyError(result.reason) });
+        }
+      });
+    }
+    if (!updates.length) {
+      const message = failures[0]?.message || "ZoomInfo refresh returned no usable account data";
+      await persistence.updateZoomInfoMeta({ error: message });
+      throw new Error(message);
+    }
+    const updatedAccounts = await applyAndPersistZoomInfoUpdates(updates, currentAccounts);
+    await persistence.updateZoomInfoMeta({
+      lastSuccessfulRefreshAt: new Date().toISOString(),
+      cacheExpiresAt: cacheExpirations.length ? new Date(Math.min(...cacheExpirations)).toISOString() : undefined,
+      error: undefined,
+    });
+    return {
+      accounts: updatedAccounts,
+      summary: { selected: candidates.length, updated: updates.length, cached, unchanged: new Set(updatedAccounts.map((account) => account.canonicalCompanyId)).size - updates.length, failed: failures, estimatedCompanyCredits: queried * 2 },
+    };
+  } catch (error) {
+    await persistence.updateZoomInfoMeta({ error: friendlyError(error) });
+    throw error;
+  } finally {
+    if (connection) await closeClient(connection.client, connection.transport);
+    await persistence.releaseLock("zoominfo-refresh", lockOwner);
+  }
+}
+
+export function resetZoomInfoStateForTests(): void {
+  resetPersistenceForTests();
+}

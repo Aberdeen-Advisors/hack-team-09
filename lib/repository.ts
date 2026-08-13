@@ -1,14 +1,15 @@
-import { accounts, offerings, uniqueCanonicalAccountCount } from "@/lib/data";
+import { offerings, uniqueCanonicalAccountCount } from "@/lib/data";
 import { createSlackAlert, generateOutreachMock, matchOfferingMock } from "@/lib/recommendations";
 import { scoreAccount } from "@/lib/scoring";
-import type { AccountDetail, OutreachDraft } from "@/lib/schemas";
+import { getSessionAccounts } from "@/lib/session-store";
+import type { Account, AccountDetail, OutreachDraft } from "@/lib/schemas";
 
-export function getAccount(id: string) {
-  return accounts.find((account) => account.id === id);
+export function getAccount(id: string, items = getSessionAccounts()) {
+  return items.find((account) => account.id === id);
 }
 
-export function getAccountDetail(id: string, tone: OutreachDraft["tone"] = "Direct"): AccountDetail | undefined {
-  const account = getAccount(id);
+export function getAccountDetail(id: string, tone: OutreachDraft["tone"] = "Direct", items = getSessionAccounts()): AccountDetail | undefined {
+  const account = items.find((item) => item.id === id);
   if (!account) return undefined;
   const score = scoreAccount(account);
   const recommendation = matchOfferingMock(account, offerings);
@@ -17,15 +18,15 @@ export function getAccountDetail(id: string, tone: OutreachDraft["tone"] = "Dire
   return { account, score, recommendation, outreach, slack };
 }
 
-export function listAccountDetails(): AccountDetail[] {
-  return accounts.map((account) => getAccountDetail(account.id)!).sort((a, b) => b.score.total - a.score.total || a.account.name.localeCompare(b.account.name));
+export function listAccountDetails(items: Account[] = getSessionAccounts()): AccountDetail[] {
+  return items.map((account) => getAccountDetail(account.id, "Direct", items)!).sort((a, b) => b.score.total - a.score.total || a.account.name.localeCompare(b.account.name));
 }
 
-export function accountMetrics() {
-  const details = listAccountDetails();
+export function accountMetrics(items: Account[] = getSessionAccounts()) {
+  const details = listAccountDetails(items);
   return {
     rows: details.length,
-    canonicalAccounts: uniqueCanonicalAccountCount(),
+    canonicalAccounts: uniqueCanonicalAccountCount(items),
     pursueNow: details.filter((item) => item.score.total >= 80 && !item.account.duplicateOf).length,
   };
 }

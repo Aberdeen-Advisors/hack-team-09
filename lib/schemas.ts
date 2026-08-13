@@ -17,7 +17,7 @@ export type RelationshipWarmth = z.infer<typeof relationshipWarmthSchema>;
 export const signalSchema = z.object({
   id: z.string(),
   accountId: z.string(),
-  type: z.enum(["AI intent", "Executive hire", "M&A", "Transformation", "Technology modernization", "Funding"]),
+  type: z.enum(["AI intent", "Executive hire", "M&A", "Transformation", "Technology modernization", "Funding", "No current signal"]),
   summary: z.string(),
   whyNow: z.string(),
   source: sourceReferenceSchema,
@@ -34,8 +34,10 @@ export const buyerSchema = z.object({
   name: z.string(),
   title: z.string(),
   decisionRole: z.string(),
+  decisionRoleProvenance: provenanceSchema.optional(),
   warmth: relationshipWarmthSchema,
   relationshipSource: z.string(),
+  relationshipProvenance: provenanceSchema.optional(),
   suggestedPath: z.string(),
   source: sourceReferenceSchema,
 });
@@ -53,6 +55,7 @@ export const accountSchema = z.object({
   source: sourceReferenceSchema,
   signal: signalSchema,
   buyers: z.array(buyerSchema),
+  providerIds: z.object({ zoominfoCompanyId: z.string().optional() }).optional(),
   duplicateOf: z.string().optional(),
 });
 export type Account = z.infer<typeof accountSchema>;
@@ -160,7 +163,17 @@ export type ProviderDiagnostic = z.infer<typeof providerDiagnosticSchema>;
 
 export const integrationStatusSchema = z.object({
   demoMode: z.boolean(),
+  admin: z.object({ authenticated: z.boolean(), configured: z.boolean() }),
   diagnostics: z.array(providerDiagnosticSchema),
+  zoomInfo: z.object({
+    state: z.enum(["disabled", "mock", "disconnected", "authorizing", "ready", "error"]),
+    requiredToolsReady: z.boolean(),
+    liveAccounts: z.number().int().nonnegative(),
+    totalCanonicalAccounts: z.number().int().nonnegative(),
+    lastSuccessfulRefreshAt: z.string().optional(),
+    cacheExpiresAt: z.string().optional(),
+    error: z.string().optional(),
+  }).optional(),
 });
 export type IntegrationStatus = z.infer<typeof integrationStatusSchema>;
 

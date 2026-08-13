@@ -5,7 +5,7 @@ Signal-to-Outreach is a mock-first hackathon MVP for Aberdeen Advisors. It turns
 ## Architecture
 
 - Next.js 16 App Router, React, TypeScript, Tailwind CSS, Zod, Vitest, Playwright, and axe-core
-- Local typed seed data; no database or authentication
+- Typed seed data with an Upstash Redis production snapshot and a single shared administrator session
 - Dedicated rules configuration in `lib/scoring-config.ts`
 - Interchangeable signal, offering, outreach, relationship, and Slack boundaries
 - Server-only OpenAI and ZoomInfo clients with timeouts and deterministic fallback
@@ -43,9 +43,38 @@ See `.env.example`. All secrets remain server-side.
 
 Set `OPENAI_USE_MOCK=false`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL` (default `gpt-5.4-mini`). The app uses the Responses API with strict structured output and validates every response with Zod. Failed or invalid responses fall back to the deterministic mock provider.
 
-### ZoomInfo
+### ZoomInfo MCP
 
-Set `ZOOMINFO_USE_MOCK=false` and provide the OAuth and API variables. Because licensed endpoint paths and payloads vary, `ZOOMINFO_SIGNALS_PATH` is required and `normalizeZoomInfoSignal` is the isolated mapper. Update that mapper to match the licensed response; the app never invents an undocumented endpoint.
+The default `ZOOMINFO_PROVIDER=mock` keeps the deterministic demo active. For a local live connection:
+
+1. In ZoomInfo's API/MCP area, create an MCP App and register `http://localhost:3000/api/integrations/zoominfo/callback` as a redirect URI.
+2. Set `ZOOMINFO_PROVIDER=mcp`, `ZOOMINFO_MCP_CLIENT_ID`, `ZOOMINFO_MCP_CLIENT_SECRET`, `ZOOMINFO_TOKEN_ENCRYPTION_KEY`, `ADMIN_PASSWORD`, and `ADMIN_SESSION_SECRET` in `.env.local`.
+3. Start the development server, open the integration diagnostics drawer, sign in as the administrator, and click **Connect ZoomInfo**.
+4. Complete ZoomInfo sign-in, then click **Refresh signals**.
+
+The app connects directly to `https://mcp.zoominfo.com/mcp` with OAuth Authorization Code + PKCE. Access and refresh tokens are encrypted with AES-256-GCM before storage. Local development uses process memory when Redis is absent; production requires Upstash Redis so OAuth state, tokens, account results, and cache entries survive Vercel function cold starts.
+
+Each uncached refresh resolves all canonical company identities with free search, then enriches Intent and Scoops for at most five accounts. This can consume up to ten company-enrichment credits. Results are cached for 24 hours, and a distributed lock prevents simultaneous refreshes from duplicating spend. Recommended contacts are resolved without paid contact enrichment, and email or phone data is never requested or stored.
+
+### Vercel production setup
+
+1. In the ZoomInfo MCP App, select **Authorization Code** and register `https://hack-team-09.vercel.app/api/integrations/zoominfo/callback`. Keep the localhost callback registered for development.
+2. Add an Upstash Redis integration to the Vercel project. Vercel supplies `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+3. Add the Production environment variables below, then redeploy. Environment changes do not affect an existing deployment until it is redeployed.
+
+```text
+ZOOMINFO_PROVIDER=mcp
+ZOOMINFO_MCP_URL=https://mcp.zoominfo.com/mcp
+ZOOMINFO_MCP_CLIENT_ID=<ZoomInfo-issued client ID>
+ZOOMINFO_MCP_CLIENT_SECRET=<ZoomInfo-issued client secret>
+ZOOMINFO_MCP_REDIRECT_URI=https://hack-team-09.vercel.app/api/integrations/zoominfo/callback
+ZOOMINFO_TOKEN_ENCRYPTION_KEY=<base64-encoded 32-byte key>
+ADMIN_PASSWORD=<strong administrator password>
+ADMIN_SESSION_SECRET=<at least 32 random characters>
+SIGNAL_OUTREACH_REDIS_PREFIX=signal-outreach:production:v1
+```
+
+Generate the encryption key locally with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Generate the session secret independently. Never commit either value. After deployment, visitors can view the shared account snapshot, but only the signed-in administrator can connect or disconnect ZoomInfo or refresh signals.
 
 ## Demo script
 
@@ -69,7 +98,12 @@ Set `ZOOMINFO_USE_MOCK=false` and provide the OAuth and API variables. Because l
 - Public company identities are seeded, but company facts, signals, relationships, and proof points are demo research or synthetic unless explicitly labeled verified.
 - Buyer cards represent role hypotheses, not verified named contacts.
 - The app previews but does not send email or Slack messages.
-- No CRM synchronization, historical analytics, role management, or persistent system of record.
+- No CRM synchronization, historical analytics, multi-user role management, or long-term historical reporting.
+- The production account snapshot is shared by all viewers; only one administrator identity controls the ZoomInfo connection.
+
+## Manual ZoomInfo smoke test
+
+With MCP mode and credentials configured, verify that the diagnostics drawer reaches `ready`, the required tools are reported available, and a refresh updates up to five accounts with `verified` ZoomInfo provenance. Repeat the refresh and confirm the toast reports cached accounts and zero estimated credits. Disconnect ZoomInfo and confirm another live refresh is blocked without replacing the last visible data with demo content.
 
 ## Phase two
 

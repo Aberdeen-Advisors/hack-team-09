@@ -16,6 +16,8 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@upstash/redis": "^1.38.2",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "latest",

@@ -12,6 +12,7 @@ const warmthClass = (warmth: string) => warmth === "Warm" ? "warm" : warmth === 
 
 export function Dashboard({ initialDetails, initialStatus, metrics, initialAccountId, initialStage }: DashboardProps) {
   const [details, setDetails] = useState(initialDetails);
+  const [workspaceMetrics, setWorkspaceMetrics] = useState(metrics);
   const [selectedId, setSelectedId] = useState(initialAccountId ?? initialDetails[0]?.account.id ?? "");
   const [stage, setStage] = useState<WorkspaceStage>(initialStage);
   const [mobileDetail, setMobileDetail] = useState(false);
@@ -27,6 +28,8 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const [drafts, setDrafts] = useState<Record<string, OutreachDraft>>({});
   const [draftBodies, setDraftBodies] = useState<Record<string, string>>({});
   const [generating, setGenerating] = useState(false);
+  const [adminPassword, setAdminPassword] = useState("");
+  const [adminBusy, setAdminBusy] = useState(false);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const selected = details.find((item) => item.account.id === selectedId) ?? details[0];
@@ -38,7 +41,15 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
     url.searchParams.set("account", selected.account.id); url.searchParams.set("stage", stage);
     window.history.replaceState(null, "", url);
   }, [selected, stage]);
-  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
+  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 5000); return () => clearTimeout(timer); }, [toast]);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const zoomInfo = params.get("zoominfo");
+    const message = zoomInfo === "connected" ? "ZoomInfo connected. Refresh signals to load live data." : zoomInfo === "error" ? params.get("message") || "ZoomInfo connection failed." : "";
+    if (!message) return;
+    const timer = window.setTimeout(() => setToast(message), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const industries = useMemo(() => Array.from(new Set(details.map((item) => item.account.industry))).sort(), [details]);
   const signalTypes = useMemo(() => Array.from(new Set(details.map((item) => item.account.signal.type))).sort(), [details]);
@@ -57,10 +68,62 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
       if (!response.ok) throw new Error(payload.error || "Refresh failed");
       if (payload.details) setDetails(payload.details);
       if (payload.status) setStatus(payload.status);
+      if (payload.metrics) setWorkspaceMetrics(payload.metrics);
       setSelectedId(payload.featuredAccountId || selectedId); setStage("prioritize");
-      setToast(`${payload.signalCount} canonical signals refreshed. ${payload.fallback ? "Mock fallback active." : "Live provider active."}`);
+      const refresh = payload.refresh;
+      setToast(refresh ? `${refresh.updated} accounts refreshed (${refresh.cached} cached, ${refresh.failed.length} failed). Estimated credits: ${refresh.estimatedCompanyCredits}.${refresh.failed.length ? ` Failed: ${refresh.failed.map((item: { accountName: string }) => item.accountName).join(", ")}.` : ""}` : `${payload.signalCount} canonical signals refreshed.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Unable to refresh signals"); }
     finally { setRefreshing(false); }
+  }
+
+  async function refreshStatus() {
+    const response = await fetch("/api/integrations/status", { cache: "no-store" });
+    if (response.ok) setStatus(await response.json());
+  }
+
+  async function connectZoomInfo() {
+    setAdminBusy(true);
+    try {
+      const response = await fetch("/api/integrations/zoominfo/connect", { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Unable to connect ZoomInfo");
+      window.location.assign(payload.authorizationUrl);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to connect ZoomInfo"); setAdminBusy(false); }
+  }
+
+  async function signInAdmin(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAdminBusy(true);
+    try {
+      const response = await fetch("/api/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: adminPassword }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Administrator sign-in failed");
+      setAdminPassword("");
+      await refreshStatus();
+      setToast("Administrator controls unlocked.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Administrator sign-in failed"); }
+    finally { setAdminBusy(false); }
+  }
+
+  async function signOutAdmin() {
+    setAdminBusy(true);
+    try {
+      const response = await fetch("/api/admin/logout", { method: "POST" });
+      if (!response.ok) throw new Error("Unable to sign out");
+      await refreshStatus();
+      setToast("Administrator signed out.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to sign out"); }
+    finally { setAdminBusy(false); }
+  }
+
+  async function disconnectZoomInfo() {
+    try {
+      const response = await fetch("/api/integrations/zoominfo/disconnect", { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Unable to disconnect ZoomInfo");
+      await refreshStatus();
+      setToast("ZoomInfo disconnected. Previously refreshed account data remains visible.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Unable to disconnect ZoomInfo"); }
   }
 
   async function regenerate() {
@@ -84,17 +147,19 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   if (!selected) return <main className="empty-state">No demo accounts are available.</main>;
   const warm = selected.account.buyers.find((buyer) => buyer.warmth === "Warm");
   const recommendation = selected.recommendation;
+  const zoomInfoNeedsConnection = status.zoomInfo && !["mock", "ready"].includes(status.zoomInfo.state);
+  const isAdmin = status.admin.authenticated;
 
   return <div className="app-shell">
     <div className="top-rule" />
     <header className="app-header">
       <div className="brand-cluster"><div className="brand-lockup"><Image src="/aberdeen-logo.png" alt="Aberdeen Advisors" width={132} height={30} priority /></div><div className="header-copy"><h1>Signal-to-Outreach</h1><p>Turn live buying signals into decision-ready pursuits.</p></div></div>
-      <div className="header-actions">{status.diagnostics.slice(0, 2).map((item) => <span className="status-pill" key={item.provider}><span className={`status-dot ${item.configured ? "ready" : ""}`} />{item.provider}: {item.mode}</span>)}{status.demoMode && <span className="status-pill demo-pill">Demo mode</span>}<button className="icon-button" aria-label="Open integration diagnostics" onClick={() => setDrawerOpen(true)}><Settings2 size={17} /></button></div>
+      <div className="header-actions">{status.diagnostics.slice(0, 2).map((item) => <span className="status-pill" key={item.provider}><span className={`status-dot ${item.configured ? "ready" : ""}`} />{item.provider}: {item.provider === "ZoomInfo" && status.zoomInfo ? status.zoomInfo.state : item.mode}</span>)}{status.demoMode && <span className="status-pill demo-pill">Demo mode</span>}<button className="icon-button" aria-label="Open integration diagnostics" onClick={() => setDrawerOpen(true)}><Settings2 size={17} /></button></div>
     </header>
     <div className="workspace">
       <aside className={`queue-panel ${mobileDetail ? "mobile-hidden" : ""}`} aria-label="Account queue">
-        <div className="queue-header"><div className="eyebrow">Signal queue</div><div className="queue-title-row"><h2>Who to call today</h2><span>{metrics.canonicalAccounts} companies · {metrics.rows} rows</span></div>
-          <button className="refresh-button" onClick={refreshSignals} disabled={refreshing}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : "Refresh signals"}</button>
+        <div className="queue-header"><div className="eyebrow">Signal queue</div><div className="queue-title-row"><h2>Who to call today</h2><span>{workspaceMetrics.canonicalAccounts} companies · {workspaceMetrics.rows} rows</span></div>
+          <button className="refresh-button" onClick={refreshSignals} disabled={refreshing || !isAdmin || Boolean(zoomInfoNeedsConnection)}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : !isAdmin ? "Admin sign in to refresh" : zoomInfoNeedsConnection ? "Connect ZoomInfo to refresh" : "Refresh signals"}</button>
           <div className="filters"><select aria-label="Sort account queue" value={sort} onChange={(e) => setSort(e.target.value)}><option value="score">Highest score</option><option value="company">Company A-Z</option></select><select aria-label="Filter by industry" value={industry} onChange={(e) => setIndustry(e.target.value)}><option value="all">All industries</option>{industries.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by signal type" value={signalType} onChange={(e) => setSignalType(e.target.value)}><option value="all">All signals</option>{signalTypes.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by relationship" value={warmOnly ? "warm" : "all"} onChange={(e) => setWarmOnly(e.target.value === "warm")}><option value="all">All relationships</option><option value="warm">Warm only</option></select></div>
           <p className="refresh-note">Ranked by explainable ICP fit. Unknown evidence earns zero points.</p>
         </div>
@@ -107,12 +172,12 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
         <div className="stage-tabs" role="tablist" aria-label="Pursuit workflow">{stages.map((item, index) => <button key={item.id} ref={(node) => { tabRefs.current[index] = node; }} id={`tab-${item.id}`} className="stage-tab" role="tab" aria-selected={stage === item.id} aria-controls={`panel-${item.id}`} tabIndex={stage === item.id ? 0 : -1} onClick={() => setStage(item.id)} onKeyDown={(event) => onTabKeyDown(event, index)}><span>{index + 1}</span>{item.label}</button>)}</div>
         <section className="content-area" role="tabpanel" id={`panel-${stage}`} aria-labelledby={`tab-${stage}`}>
           {stage === "prioritize" && <><div className="grid-two"><article className="card"><div className="card-header"><div><div className="eyebrow">Why now</div><h3>{selected.account.signal.type}</h3></div>{provenanceBadge(selected.account.signal.source.provenance)}</div><div className="signal-callout"><strong>{selected.account.signal.summary}</strong><p>{selected.account.signal.whyNow}</p></div><p>This is a buying-trigger hypothesis, not proof of budget. Confirm the initiative, executive sponsor, timing, and business outcome before advancing.</p><div className="source-line"><SignalIcon size={13} />{selected.account.signal.source.label} · {selected.account.signal.date}{selected.account.signal.source.url && <a href={selected.account.signal.source.url} target="_blank" rel="noreferrer">View source <ExternalLink size={10} /></a>}</div></article><article className="card"><div className="card-header"><div><div className="eyebrow">Fit score</div><h3>{selected.score.total}/100 · {selected.score.category}</h3></div><span className={`badge ${selected.score.total >= 80 ? "warm" : "indirect"}`}>{selected.score.recommendedAction}</span></div><div className="score-breakdown">{selected.score.components.map((component) => <div className="score-component" key={component.key}><div className="score-component-name">{component.label}</div><div className="score-component-value">{component.earned}/{component.possible}</div><div className="score-bar"><span style={{ width: `${(component.earned / component.possible) * 100}%` }} /></div><div className="component-note">{component.explanation}</div></div>)}</div></article></div><div className="next-action"><button className="primary-button" onClick={advance}>Map buyer and offering <ArrowRight size={15} /></button></div></>}
-          {stage === "pursuit" && <><div className="grid-two"><article className="card"><div className="card-header"><div><div className="eyebrow">Buyer map</div><h3>Likely buying committee</h3></div><Users size={20} color="#44b0b1" /></div><div className="buyer-list">{selected.account.buyers.map((buyer) => <div className="buyer-card" key={buyer.id}><div className="buyer-card-top"><div><h4>{buyer.name}</h4><p>{buyer.decisionRole}</p></div><span className={`badge ${warmthClass(buyer.warmth)}`}>{buyer.warmth}</span></div><div className="buyer-path"><strong>Suggested path:</strong> {buyer.suggestedPath}<div className="source-line">{provenanceBadge(buyer.source.provenance)} {buyer.relationshipSource}</div></div></div>)}</div></article><article className="card"><div className="offering-hero"><div className="eyebrow">{recommendation.provenance} recommendation</div><h4>{recommendation.recommendedOffering}</h4><p>{recommendation.fitRationale}</p></div><h3>What to lead with</h3><p>{recommendation.suggestedLeadMessage}</p><div className="tag-row">{recommendation.assumptions.slice(0, 2).map((item) => <span className="tag" key={item}>{item}</span>)}</div><div className="callout-warning"><strong>Synthetic proof point:</strong> {recommendation.supportingCredential}</div><h3 style={{ marginTop: 18 }}>Evidence used</h3><ul className="evidence-list">{recommendation.evidenceUsed.map((item) => <li key={item}>{item}</li>)}</ul></article></div><div className="next-action"><button className="primary-button" onClick={advance}>Draft outreach <Sparkles size={15} /></button></div></>}
+          {stage === "pursuit" && <><div className="grid-two"><article className="card"><div className="card-header"><div><div className="eyebrow">Buyer map</div><h3>Likely buying committee</h3></div><Users size={20} color="#44b0b1" /></div><div className="buyer-list">{selected.account.buyers.length ? selected.account.buyers.map((buyer) => <div className="buyer-card" key={buyer.id}><div className="buyer-card-top"><div><h4>{buyer.name}</h4><p>{buyer.decisionRole}{buyer.decisionRoleProvenance === "inferred" ? " · inferred role" : ""}</p></div><span className={`badge ${warmthClass(buyer.warmth)}`}>{buyer.warmth}</span></div><div className="buyer-path"><strong>Suggested path:</strong> {buyer.suggestedPath}<div className="source-line">{provenanceBadge(buyer.source.provenance)} {buyer.relationshipSource}</div></div></div>) : <div className="callout-warning">ZoomInfo returned no recommended contacts for this account. No buyer identity was inferred.</div>}</div></article><article className="card"><div className="offering-hero"><div className="eyebrow">{recommendation.provenance} recommendation</div><h4>{recommendation.recommendedOffering}</h4><p>{recommendation.fitRationale}</p></div><h3>What to lead with</h3><p>{recommendation.suggestedLeadMessage}</p><div className="tag-row">{recommendation.assumptions.slice(0, 2).map((item) => <span className="tag" key={item}>{item}</span>)}</div><div className="callout-warning"><strong>Synthetic proof point:</strong> {recommendation.supportingCredential}</div><h3 style={{ marginTop: 18 }}>Evidence used</h3><ul className="evidence-list">{recommendation.evidenceUsed.map((item) => <li key={item}>{item}</li>)}</ul></article></div><div className="next-action"><button className="primary-button" onClick={advance}>Draft outreach <Sparkles size={15} /></button></div></>}
           {stage === "outreach" && <div className="grid-two"><article className="card"><div className="card-header"><div><div className="eyebrow">First-touch email</div><h3>Ready for human review</h3></div><span className="badge demo">{activeDraft?.provenance}</span></div><div className="email-controls"><select className="tone-select" aria-label="Email tone" value={tone} onChange={(e) => setTone(e.target.value as OutreachDraft["tone"])}><option>Direct</option><option>Relationship-led</option><option>Executive</option></select><button className="secondary-button" onClick={regenerate} disabled={generating}>{generating ? <LoaderCircle size={14} /> : <RefreshCw size={14} />}Regenerate</button><button className="primary-button" onClick={copyDraft}><Clipboard size={14} />Copy draft</button></div><div className="email-subject"><strong>Subject:</strong>{activeDraft?.subject}</div><textarea className="email-editor" aria-label="Editable outreach email" value={draftBody} onChange={(e) => setDraftBodies((current) => ({ ...current, [selected.account.id]: e.target.value }))} /><div className="editor-footer"><span>{draftBody.trim().split(/\s+/).filter(Boolean).length} words</span><span>Not sent · verify all demo facts before use</span></div></article><article className="card"><div className="card-header"><div><div className="eyebrow">Slack alert preview</div><h3>Share the pursuit</h3></div><span className="badge demo">Preview only</span></div><div className="slack-preview"><div className="slack-title">#growth-signals</div><div className="slack-body"><h4>🔔 New pursuit signal: {selected.slack.account}</h4><div className="slack-field"><strong>Signal</strong><span>{selected.slack.signal}</span></div><div className="slack-field"><strong>ICP score</strong><span>{selected.slack.score}/100 · {selected.score.category}</span></div><div className="slack-field"><strong>Buyer</strong><span>{selected.slack.recommendedBuyer}{warm ? ` · Warm path via ${warm.relationshipSource.split(":")[0]}` : ""}</span></div><div className="slack-field"><strong>Offering</strong><span>{selected.slack.recommendedOffering}</span></div><button className="secondary-button" style={{ marginTop: 14 }} onClick={() => setToast("Preview only—no Slack message was sent.")}>Review pursuit <ChevronRight size={13} /></button></div></div><div className="callout-warning"><Check size={14} style={{ verticalAlign: "middle", marginRight: 7 }} />The mock notifier creates a structured payload but never sends externally.</div></article></div>}
         </section>
       </main>
     </div>
-    {drawerOpen && <><div className="drawer-backdrop" onClick={() => setDrawerOpen(false)} /><aside className="drawer" aria-label="Integration diagnostics"><div className="drawer-header"><div><div className="eyebrow">Developer diagnostics</div><h2>Integration status</h2></div><button className="icon-button" aria-label="Close diagnostics" onClick={() => setDrawerOpen(false)}><X size={18} /></button></div><p style={{ fontSize: 11, lineHeight: 1.6 }}>Credentials never reach the browser. Missing or failed live providers fall back without blocking the demo.</p>{status.diagnostics.map((item) => <div className="diagnostic" key={item.provider}><div className="diagnostic-top"><strong>{item.provider}</strong><span className={`badge ${item.configured ? "warm" : "indirect"}`}>{item.mode}</span></div><p>{item.message}</p><div className="source-line">Configuration {item.configured ? "present" : "missing"} · {item.status}</div></div>)}</aside></>}
+    {drawerOpen && <><div className="drawer-backdrop" onClick={() => setDrawerOpen(false)} /><aside className="drawer" aria-label="Integration diagnostics"><div className="drawer-header"><div><div className="eyebrow">Developer diagnostics</div><h2>Integration status</h2></div><button className="icon-button" aria-label="Close diagnostics" onClick={() => setDrawerOpen(false)}><X size={18} /></button></div><p style={{ fontSize: 11, lineHeight: 1.6 }}>ZoomInfo credentials and encrypted OAuth tokens remain server-side. Failed live refreshes preserve prior data and never substitute demo results silently.</p>{!isAdmin ? <form className="admin-form" onSubmit={signInAdmin}><strong>Administrator controls</strong><p>Sign in to connect ZoomInfo, spend refresh credits, or disconnect the shared integration.</p><label htmlFor="admin-password">Administrator password</label><input id="admin-password" type="password" autoComplete="current-password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} disabled={adminBusy || !status.admin.configured} /><button className="primary-button" type="submit" disabled={adminBusy || !adminPassword || !status.admin.configured}>{adminBusy ? "Signing in..." : "Sign in"}</button>{!status.admin.configured && <div className="callout-warning">Administrator access is not configured on this deployment.</div>}</form> : <div className="admin-session"><span className="badge warm">Administrator</span><button className="secondary-button" onClick={signOutAdmin} disabled={adminBusy}>Sign out</button></div>}{status.zoomInfo && <div className="diagnostic"><div className="diagnostic-top"><strong>ZoomInfo MCP connection</strong><span className={`badge ${status.zoomInfo.state === "ready" ? "warm" : "indirect"}`}>{status.zoomInfo.state}</span></div><p>{status.zoomInfo.liveAccounts} of {status.zoomInfo.totalCanonicalAccounts} canonical accounts currently use live ZoomInfo signals.</p>{status.zoomInfo.lastSuccessfulRefreshAt && <div className="source-line">Last live refresh {new Date(status.zoomInfo.lastSuccessfulRefreshAt).toLocaleString()}</div>}{isAdmin && <div style={{ display: "flex", gap: 8, marginTop: 12 }}>{status.zoomInfo.state === "ready" ? <button className="secondary-button" onClick={disconnectZoomInfo}>Disconnect ZoomInfo</button> : status.zoomInfo.state !== "mock" && <button className="primary-button" onClick={connectZoomInfo} disabled={adminBusy}>Connect ZoomInfo</button>}</div>}</div>}{status.diagnostics.map((item) => <div className="diagnostic" key={item.provider}><div className="diagnostic-top"><strong>{item.provider}</strong><span className={`badge ${item.configured ? "warm" : "indirect"}`}>{item.mode}</span></div><p>{item.message}</p>{isAdmin && <div className="source-line">Configuration {item.configured ? "present" : "missing"} · {item.status}</div>}</div>)}</aside></>}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }

@@ -5,7 +5,6 @@ import { generateOutreachMock, matchOfferingMock } from "@/lib/recommendations";
 import {
   offeringRecommendationSchema,
   outreachDraftSchema,
-  signalSchema,
   type Account,
   type IntegrationStatus,
   type Offering,
@@ -13,6 +12,8 @@ import {
   type OutreachDraft,
   type Signal,
 } from "@/lib/schemas";
+import { adminConfigurationError } from "@/lib/admin-auth";
+import { zoomInfoIntegrationSnapshot, zoomInfoMode } from "@/lib/zoominfo-mcp";
 
 export interface SignalProvider {
   refresh(items: Account[]): Promise<Signal[]>;
@@ -66,64 +67,6 @@ export class MockSignalProvider implements SignalProvider {
   }
 }
 
-type ZoomInfoRawSignal = Record<string, unknown>;
-
-export function normalizeZoomInfoSignal(raw: ZoomInfoRawSignal, accountId: string): Signal {
-  const mapped = {
-    id: String(raw.id ?? `zoominfo-${accountId}`),
-    accountId,
-    type: raw.type,
-    summary: raw.summary,
-    whyNow: raw.whyNow,
-    source: {
-      label: "ZoomInfo licensed signal",
-      url: typeof raw.sourceUrl === "string" ? raw.sourceUrl : undefined,
-      observedAt: new Date().toISOString(),
-      provenance: "verified",
-    },
-    date: raw.date,
-    relevantIntent: raw.relevantIntent ?? null,
-    activeWithin90Days: raw.activeWithin90Days ?? null,
-    transformationEvidence: raw.transformationEvidence ?? null,
-    mergerOrAcquisition: raw.mergerOrAcquisition ?? null,
-  };
-  return signalSchema.parse(mapped);
-}
-
-export class ZoomInfoSignalProvider implements SignalProvider {
-  async refresh(items: Account[]): Promise<Signal[]> {
-    const authUrl = process.env.ZOOMINFO_AUTH_URL;
-    const baseUrl = process.env.ZOOMINFO_API_BASE_URL;
-    const signalsPath = process.env.ZOOMINFO_SIGNALS_PATH;
-    const clientId = process.env.ZOOMINFO_CLIENT_ID;
-    const clientSecret = process.env.ZOOMINFO_CLIENT_SECRET;
-    if (!authUrl || !baseUrl || !signalsPath || !clientId || !clientSecret) throw new Error("ZoomInfo live configuration is incomplete");
-
-    const tokenResponse = await withTimeout(fetch(authUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ grant_type: "client_credentials", client_id: clientId, client_secret: clientSecret }),
-      cache: "no-store",
-    }), "ZoomInfo authentication");
-    if (!tokenResponse.ok) throw new Error(`ZoomInfo authentication failed (${tokenResponse.status})`);
-    const tokenJson = await tokenResponse.json() as { access_token?: string };
-    if (!tokenJson.access_token) throw new Error("ZoomInfo authentication response did not include an access token");
-
-    // The licensed endpoint path and mapper intentionally remain configuration-owned.
-    const unique = Array.from(new Map(items.map((item) => [item.canonicalCompanyId, item])).values());
-    const response = await withTimeout(fetch(new URL(signalsPath, baseUrl), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${tokenJson.access_token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ companies: unique.map((item) => ({ id: item.canonicalCompanyId, domain: new URL(item.website).hostname })) }),
-      cache: "no-store",
-    }), "ZoomInfo signal request");
-    if (!response.ok) throw new Error(`ZoomInfo signal request failed (${response.status})`);
-    const payload = await response.json() as { signals?: ZoomInfoRawSignal[] };
-    if (!Array.isArray(payload.signals)) throw new Error("ZoomInfo mapper placeholder: expected a signals array from the licensed endpoint");
-    return payload.signals.map((raw) => normalizeZoomInfoSignal(raw, String(raw.accountId ?? "unknown")));
-  }
-}
-
 export class MockOfferingMatcher implements OfferingMatcher {
   async match(account: Account, catalog: Offering[]): Promise<OfferingRecommendation> {
     return matchOfferingMock(account, catalog);
@@ -170,11 +113,11 @@ export class OpenAIOutreachGenerator implements OutreachGenerator {
 
 export function providers() {
   const openAIConfigured = Boolean(process.env.OPENAI_API_KEY);
-  const zoomConfigured = Boolean(process.env.ZOOMINFO_CLIENT_ID && process.env.ZOOMINFO_CLIENT_SECRET && process.env.ZOOMINFO_AUTH_URL && process.env.ZOOMINFO_API_BASE_URL && process.env.ZOOMINFO_SIGNALS_PATH);
+  const zoomConfigured = Boolean(process.env.ZOOMINFO_MCP_CLIENT_ID && process.env.ZOOMINFO_MCP_CLIENT_SECRET);
   const useOpenAIMock = isTrue(process.env.OPENAI_USE_MOCK) || !openAIConfigured;
-  const useZoomMock = isTrue(process.env.ZOOMINFO_USE_MOCK) || !zoomConfigured;
+  const useZoomMock = zoomInfoMode() !== "mcp";
   return {
-    signal: useZoomMock ? new MockSignalProvider() : new ZoomInfoSignalProvider(),
+    signal: new MockSignalProvider(),
     offering: useOpenAIMock ? new MockOfferingMatcher() : new OpenAIOfferingMatcher(),
     outreach: useOpenAIMock ? new MockOutreachGenerator() : new OpenAIOutreachGenerator(),
     useOpenAIMock,
@@ -196,16 +139,27 @@ export async function outreachWithFallback(account: Account, recommendation: Off
   catch { return generateOutreachMock(account, recommendation, tone); }
 }
 
-export function integrationStatus(): IntegrationStatus {
+export async function integrationStatus(admin = false): Promise<IntegrationStatus> {
   const selected = providers();
+  const zoomInfo = await zoomInfoIntegrationSnapshot(admin);
   const checkedAt = new Date().toISOString();
+  const zoomStatus = zoomInfo.state === "error" ? "error" : zoomInfo.state === "ready" || zoomInfo.state === "mock" ? "ready" : "not-configured";
+  const zoomMessage = zoomInfo.state === "mock"
+    ? "Using deduplicated synthetic signals. Set ZOOMINFO_PROVIDER=mcp to enable the local OAuth connection."
+    : zoomInfo.state === "ready"
+      ? `Connected to ZoomInfo MCP with required tools ready; ${zoomInfo.liveAccounts} of ${zoomInfo.totalCanonicalAccounts} accounts currently have live signals.`
+      : admin
+        ? zoomInfo.error || "ZoomInfo MCP is configured but not connected."
+        : "ZoomInfo is not connected. An administrator can manage the connection.";
   return {
-    demoMode: selected.useOpenAIMock || selected.useZoomMock,
+    demoMode: selected.useOpenAIMock || zoomInfo.liveAccounts < zoomInfo.totalCanonicalAccounts,
     diagnostics: [
-      { provider: "ZoomInfo", mode: selected.useZoomMock ? "mock" : "live", configured: selected.zoomConfigured, status: selected.zoomConfigured ? "ready" : "not-configured", message: selected.useZoomMock ? "Using deduplicated synthetic signals." : "Licensed endpoint configuration is present.", checkedAt },
+      { provider: "ZoomInfo", mode: selected.useZoomMock ? "mock" : "live", configured: zoomInfo.state === "ready", status: zoomStatus, message: zoomMessage, checkedAt },
       { provider: "OpenAI", mode: selected.useOpenAIMock ? "mock" : "live", configured: selected.openAIConfigured, status: selected.openAIConfigured ? "ready" : "not-configured", message: selected.useOpenAIMock ? "Using deterministic offering and outreach generators." : `Configured for ${process.env.OPENAI_MODEL || "gpt-5.4-mini"}.`, checkedAt },
       { provider: "Slack", mode: "mock", configured: false, status: "not-configured", message: "Preview only; no messages are sent.", checkedAt },
     ],
+    zoomInfo,
+    admin: { authenticated: admin, configured: !adminConfigurationError() },
   };
 }
 

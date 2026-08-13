@@ -46,7 +46,7 @@ export function createSlackAlert(account: Account, score: number, recommendation
     account: account.name,
     signal: account.signal.summary,
     score,
-    recommendedBuyer: account.buyers[0].title,
+    recommendedBuyer: account.buyers[0]?.title ?? "Buyer research required",
     recommendedOffering: recommendation.recommendedOffering,
     reviewUrl: `/?account=${account.id}&stage=prioritize`,
     provenance: "demo",

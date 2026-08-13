@@ -4,11 +4,12 @@ import { offerings } from "@/lib/data";
 import { getAccount } from "@/lib/repository";
 import { matchOfferingMock } from "@/lib/recommendations";
 import { outreachWithFallback, providers } from "@/lib/providers";
+import { loadAccounts } from "@/lib/session-store";
 
 const requestSchema = z.object({ tone: z.enum(["Direct", "Relationship-led", "Executive"]).default("Direct") });
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const account = getAccount((await params).id);
+  const account = getAccount((await params).id, await loadAccounts());
   if (!account) return NextResponse.json({ error: "Account not found" }, { status: 404 });
   const parsed = requestSchema.safeParse(await request.json().catch(() => ({})));
   if (!parsed.success) return NextResponse.json({ error: "Invalid tone", issues: parsed.error.issues }, { status: 400 });
