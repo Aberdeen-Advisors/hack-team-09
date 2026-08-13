@@ -405,6 +405,15 @@ function numberValue(record: UnknownRecord, keys: string[]): number | undefined 
   return undefined;
 }
 
+// Describes an unusable response without dumping licensed data into an error string.
+function payloadPreview(payload: unknown): string {
+  if (payload === null || payload === undefined) return `payload was ${String(payload)}`;
+  if (typeof payload === "string") return `payload was text: "${payload.slice(0, 120)}"`;
+  if (Array.isArray(payload)) return `payload was an empty array`;
+  if (typeof payload === "object") return `payload keys: ${Object.keys(payload).join(", ").slice(0, 120)}`;
+  return `payload was a ${typeof payload}`;
+}
+
 function normalizeDomain(value: string): string {
   try { return new URL(value.includes("://") ? value : `https://${value}`).hostname.replace(/^www\./, "").toLowerCase(); }
   catch { return value.replace(/^www\./, "").replace(/\/$/, "").toLowerCase(); }
@@ -420,16 +429,19 @@ export function recordDomains(record: UnknownRecord): string[] {
 }
 
 async function resolveCompany(client: Client, account: Account): Promise<{ companyId: string; record: UnknownRecord }> {
-  const payload = await callTool(client, "search_companies", { companyWebsite: account.website, pageSize: 10, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
-  const records = findRecords(payload, ["companies", "results", "data", "records"]);
+  // Seeded websites are full URLs and some carry a path ("/about/"). ZoomInfo matches on
+  // the bare hostname, so searching with the raw URL returned nothing for every account
+  // while the comparison below was already normalizing. Both sides must use the same form.
   const expectedDomain = normalizeDomain(account.website);
+  const payload = await callTool(client, "search_companies", { companyWebsite: expectedDomain, pageSize: 10, userIntent: "Resolve a seeded target account by official website for signal monitoring." });
+  const records = findRecords(payload, ["companies", "results", "data", "records"]);
   const matches = records.filter((record) => recordDomains(record).includes(expectedDomain));
   if (matches.length !== 1) {
     // Without the domains ZoomInfo actually returned there is no way to tell an empty
     // result apart from a response this code failed to parse.
     const observed = [...new Set(records.flatMap(recordDomains))].slice(0, 5);
     const seen = records.length === 0
-      ? "the search returned no readable records"
+      ? `the search returned no readable records (${payloadPreview(payload)})`
       : `the search returned ${records.length} record(s) with domains ${observed.length ? observed.join(", ") : "that could not be read"}`;
     throw new Error(matches.length ? `ZoomInfo returned ${matches.length} exact domain matches for ${expectedDomain}` : `No exact ZoomInfo domain match for ${expectedDomain}; ${seen}`);
   }

@@ -26,6 +26,8 @@ describe("ZoomInfo MCP normalization", () => {
   it("reads every domain a company publishes, not just the first", () => {
     expect(recordDomains({ domainList: ["vacationclub.com", "marriottvacationsworldwide.com"] })).toContain("marriottvacationsworldwide.com");
     expect(recordDomains({ companyWebsite: "https://www.MarriottVacationsWorldwide.com/" })).toEqual(["marriottvacationsworldwide.com"]);
+    // Seeded sites carry schemes, www, and sometimes a path; all must reduce to the host.
+    expect(recordDomains({ website: "https://www.draftkings.com/about/" })).toEqual(["draftkings.com"]);
     expect(recordDomains({})).toEqual([]);
   });
 
