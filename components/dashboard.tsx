@@ -77,7 +77,7 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
       if (!response.ok) throw new Error(payload.error || "Refresh failed");
       setSelectedId(accountId || selectedId || payload.featuredAccountId); setStage("prioritize");
       const refresh = payload.refresh;
-      setToast(refresh ? `${refresh.updated} accounts refreshed (${refresh.cached} cached, ${refresh.failed.length} failed). Estimated credits: ${refresh.estimatedCompanyCredits}.${refresh.failed.length ? ` Failed: ${refresh.failed.map((item: { accountName: string }) => item.accountName).join(", ")}.` : ""}` : `${payload.signalCount} canonical signals refreshed.`);
+      setToast(refresh ? `${refresh.updated} accounts refreshed (${refresh.cached} cached, ${refresh.failed.length} failed). ${refresh.estimatedCompanyCredits === null ? "Credit usage: check ZoomInfo usage." : `Estimated credits: ${refresh.estimatedCompanyCredits}.`}${refresh.failed.length ? ` Failed: ${refresh.failed.map((item: { accountName: string }) => item.accountName).join(", ")}.` : ""}` : `${payload.signalCount} canonical signals refreshed.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Unable to refresh signals"); }
     finally { setRefreshing(false); }
   }

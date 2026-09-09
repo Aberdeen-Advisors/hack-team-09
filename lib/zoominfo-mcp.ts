@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   Client,
   StreamableHTTPClientTransport,
@@ -15,7 +15,9 @@ import { scoreAccount } from "@/lib/scoring";
 import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate, type ZoomInfoCompanyProfile } from "@/lib/session-store";
 import { decryptOAuthTokens, encryptOAuthTokens, tokenEncryptionConfigured } from "@/lib/token-crypto";
 
-const REQUIRED_TOOLS = ["lookup", "search_companies", "enrich_intent", "enrich_scoops", "get_recommended_contacts", "search_contacts"] as const;
+const REQUIRED_TOOLS = ["lookup", "search_companies", "get_recommended_contacts", "search_contacts"] as const;
+type SignalToolMode = "unified" | "legacy";
+let signalToolModes = new WeakMap<Client, SignalToolMode>();
 const DEFAULT_TOPIC_QUERIES = ["artificial intelligence", "generative AI", "digital transformation", "cloud migration", "data analytics"];
 const RELEVANT_SCOOP_TYPES = ["Funding", "Mergers & Acquisitions (M&A)", "New Hire", "Promotion", "Management Move", "Executive Move", "Project", "Pain Point", "Partnership", "Product Launch", "Facilities Relocation / Expansion"];
 
@@ -231,22 +233,29 @@ function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefine
     .join(", ");
 }
 
-// ZoomInfo deprecates tools in place: the old name keeps returning data with a warning
-// appended. Record the successor's declared parameters so a migration can be made from
-// the server's own contract rather than guessing at the newer argument names.
-let supersededToolSummary: string | undefined;
-
+// Prefer ZoomInfo's supported replacement. Keep the old pair for accounts whose
+// server still exposes it. Selection belongs to a connection, never a global user.
 async function discoverRequiredTools(client: Client): Promise<void> {
-  const listed = await client.listTools();
-  const names = listed.tools.map((tool) => tool.name);
-  const missing = REQUIRED_TOOLS.filter((name) => !names.includes(name));
-  lookupSchemaSummary = summarizeToolSchema(listed.tools.find((tool) => tool.name === "lookup") ?? {});
-  const successors = listed.tools.filter((tool) => REQUIRED_TOOLS.some((required) => tool.name.startsWith(`${required}_v`)));
-  supersededToolSummary = successors.length
-    ? successors.map((tool) => `${tool.name}(${summarizeToolSchema(tool) || "no declared properties"})`).join("; ")
-    : undefined;
-  await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0 });
-  if (missing.length) throw new Error(`ZoomInfo account is missing required MCP tools: ${missing.join(", ")}`);
+  signalToolModes.delete(client);
+  const listed: Awaited<ReturnType<Client["listTools"]>>["tools"] = [];
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+  do {
+    const page = await client.listTools(cursor ? { cursor } : undefined);
+    listed.push(...page.tools);
+    cursor = page.nextCursor;
+    if (cursor && seenCursors.has(cursor)) throw new Error("ZoomInfo tool discovery returned a repeated page cursor");
+    if (cursor) seenCursors.add(cursor);
+  } while (cursor);
+  const names = listed.map((tool) => tool.name);
+  const missing: string[] = REQUIRED_TOOLS.filter((name) => !names.includes(name));
+  const mode = names.includes("enrich_company_signals") ? "unified"
+    : names.includes("enrich_intent") && names.includes("enrich_scoops") ? "legacy" : undefined;
+  if (!mode) missing.push("enrich_company_signals (or both legacy enrich_intent and enrich_scoops)");
+  lookupSchemaSummary = summarizeToolSchema(listed.find((tool) => tool.name === "lookup") ?? {});
+  await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0, ...(missing.length === 0 ? { error: undefined, authorizationPendingUntil: undefined } : {}) });
+  if (missing.length) throw new Error(`ZoomInfo connection lacks supported MCP capabilities: ${missing.join(", ")}. Available tools: ${names.join(", ")}.`);
+  signalToolModes.set(client, mode!);
 }
 
 export async function beginZoomInfoAuthorization(): Promise<string> {
@@ -669,7 +678,7 @@ function validDate(record: UnknownRecord, keys: string[]): string | undefined {
 
 function intentType(topic: string): Signal["type"] {
   const normalized = topic.toLowerCase();
-  if (normalized.includes("artificial intelligence") || normalized.includes("generative") || normalized.includes("machine learning")) return "AI intent";
+  if (/\bai\b/.test(normalized) || normalized.includes("artificial intelligence") || normalized.includes("generative") || normalized.includes("machine learning")) return "AI intent";
   if (normalized.includes("cloud") || normalized.includes("modern")) return "Technology modernization";
   return "Transformation";
 }
@@ -809,8 +818,83 @@ function isoDateDaysAgo(days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+// Contract verified against ZoomInfo's current MCP tool: results[].company,
+// results[].signals[{signalType, date, summary?, details}], and signalCounts.
+export function buildSignalFromCompanySignals(accountId: string, companyId: string, payload: unknown, topics: string[], now = new Date()): { signal: Signal; warnings: string[] } {
+  const results = findRecords(payload, ["results", "data", "companies"]);
+  const matches = results.filter((result) => stringValue(asRecord(result.company) ?? {}, ["zoominfoCompanyId", "companyId", "id"]) === companyId);
+  if (matches.length !== 1) throw new Error(`ZoomInfo company signals did not return exactly one result for company ${companyId}`);
+  const result = matches[0];
+  if (result.status && result.status !== "success") throw new Error(`ZoomInfo company signals returned status ${String(result.status)} for company ${companyId}`);
+  if (!Array.isArray(result.signals)) throw new Error("ZoomInfo company signals response is missing its signals array");
+  const allowedTopics = new Set(topics.map((topic) => topic.toLowerCase()));
+  const intent: UnknownRecord[] = [];
+  const scoops: UnknownRecord[] = [];
+  for (const item of result.signals) {
+    const record = asRecord(item);
+    if (!record) throw new Error("ZoomInfo returned a malformed company signal");
+    const type = stringValue(record, ["signalType"])?.toLowerCase();
+    if (type !== "intent" && type !== "scoop") continue;
+    const details = asRecord(record.details);
+    const date = validDate(record, ["date"]);
+    if (!details || !date) throw new Error("ZoomInfo returned a signal without valid details or date");
+    if (type === "intent") {
+      const topic = stringValue(details, ["topic"]);
+      const score = numberValue(details, ["signalScore"]);
+      if (!topic || score === undefined) throw new Error("ZoomInfo returned intent without a topic or signal score");
+      if (allowedTopics.has(topic.toLowerCase())) intent.push({ topic, signalScore: score, signalDate: date });
+    } else {
+      const types = Array.isArray(details.types) ? details.types.map((entry) => stringValue(asRecord(entry) ?? {}, ["type"])).filter((value): value is string => Boolean(value)) : [];
+      const mapped = types.find((value) => RELEVANT_SCOOP_TYPES.includes(value) && scoopType(value));
+      if (!mapped) continue;
+      const summary = stringValue(record, ["summary"]);
+      if (!summary) throw new Error("ZoomInfo returned a scoop without a summary");
+      const id = stringValue(record, ["id", "scoopId"]) || createHash("sha256").update(`${companyId}|${date}|${summary}`).digest("hex").slice(0, 24);
+      scoops.push({ scoopId: id, scoopType: mapped, description: summary, originalPublishedDate: date, link: stringValue(details, ["link", "url"]) });
+    }
+  }
+  const signal = buildSignalFromToolResults(accountId, { intent }, { scoops }, now);
+  const counts = asRecord(result.signalCounts) ?? {};
+  const warnings: string[] = [];
+  const incomplete = (type: string) => {
+    const count = asRecord(counts[type]) ?? {};
+    const available = numberValue(count, ["available"]);
+    const returned = numberValue(count, ["returned"]);
+    return available === undefined || returned === undefined || available > returned;
+  };
+  if (!topics.length || incomplete("intent")) {
+    warnings.push(!topics.length ? "Intent topic lookup unavailable; intent relevance could not be checked." : "ZoomInfo returned a limited intent snapshot; absence of a topic is not conclusive.");
+    if (!signal.relevantIntent) signal.relevantIntent = null;
+  }
+  if (incomplete("scoop")) {
+    warnings.push("ZoomInfo returned a limited scoop snapshot; earlier business events may be omitted.");
+    if (!signal.mergerOrAcquisition) signal.mergerOrAcquisition = null;
+  }
+  if (warnings.length) {
+    if (!signal.transformationEvidence) signal.transformationEvidence = null;
+    if (signal.type === "No current signal") {
+      signal.summary = "No qualifying trigger in the returned snapshot; signal coverage is incomplete.";
+      signal.whyNow = "Complete the missing research before concluding there is no current trigger.";
+      signal.activeWithin90Days = null;
+    }
+  }
+  return { signal, warnings };
+}
+
 async function refreshOneAccount(client: Client, account: Account, topics: string[]): Promise<ZoomInfoAccountUpdate> {
   const company = await resolveCompany(client, account);
+  if (signalToolModes.get(client) === "unified") {
+    const numericId = Number(company.companyId);
+    if (!Number.isSafeInteger(numericId) || numericId <= 0) throw new Error("ZoomInfo company ID is not a valid positive integer");
+    const [signals, buyers] = await Promise.allSettled([
+      callTool(client, "enrich_company_signals", { zoominfoCompanyIds: [numericId], signalTypes: ["INTENT", "SCOOP"], userIntent: "Find recent intent and business events for this account to support evidence-based outreach." }),
+      fetchBuyers(client, company.companyId),
+    ]);
+    if (signals.status === "rejected") throw signals.reason;
+    const normalized = buildSignalFromCompanySignals(account.id, company.companyId, signals.value, topics);
+    if (buyers.status === "rejected") normalized.warnings.push("Contact lookup failed; any previously observed contacts need rechecking.");
+    return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, ...normalized, buyers: buyers.status === "fulfilled" ? buyers.value : [], buyersFailed: buyers.status === "rejected", profile: buildCompanyProfile(company.record) };
+  }
   const lookbackDays = Number(process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90);
   const startDate = isoDateDaysAgo(lookbackDays);
   // Intent needs resolved topics and Scoops does not, so they fail independently.
@@ -866,7 +950,7 @@ export function refreshCandidates(items: Account[], accountId?: string): Account
 // Bump when a refresh starts capturing fields the cached payload does not carry, otherwise a
 // warm cache keeps serving the older, thinner shape until its TTL expires and the new data
 // never reaches the workspace. v2 added company firmographics and full signal evidence.
-const CACHE_SHAPE_VERSION = "v3";
+const CACHE_SHAPE_VERSION = "v4";
 
 function cacheKey(account: Account, topics: string[]): string {
   return `${CACHE_SHAPE_VERSION}|${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
@@ -878,7 +962,7 @@ export type ZoomInfoRefreshSummary = {
   cached: number;
   unchanged: number;
   failed: Array<{ accountId: string; accountName: string; message: string }>;
-  estimatedCompanyCredits: number;
+  estimatedCompanyCredits: number | null;
 };
 
 export class ZoomInfoRefreshInProgressError extends Error {
@@ -948,11 +1032,11 @@ export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ acc
       lastSuccessfulRefreshAt: new Date().toISOString(),
       cacheExpiresAt: cacheExpirations.length ? new Date(Math.min(...cacheExpirations)).toISOString() : undefined,
       error: undefined,
-      lastRefreshNote: [intentNote, supersededToolSummary && `Newer ZoomInfo tools are available: ${supersededToolSummary}`].filter(Boolean).join(" "),
+      lastRefreshNote: [intentNote, signalToolModes.get(client) === "unified" && "Using enrich_company_signals. Returned snapshots may be limited; review account coverage warnings."].filter(Boolean).join(" "),
     });
     return {
       accounts: updatedAccounts,
-      summary: { selected: candidates.length, updated: updates.length, cached, unchanged: new Set(updatedAccounts.map((account) => account.canonicalCompanyId)).size - updates.length, failed: failures, estimatedCompanyCredits: queried * 2 },
+      summary: { selected: candidates.length, updated: updates.length, cached, unchanged: new Set(updatedAccounts.map((account) => account.canonicalCompanyId)).size - updates.length, failed: failures, estimatedCompanyCredits: queried && signalToolModes.get(client) === "unified" ? null : queried * 2 },
     };
   } catch (error) {
     await persistence.updateZoomInfoMeta({ lastRefreshNote: friendlyError(error) });
@@ -966,6 +1050,7 @@ export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ acc
 export function resetZoomInfoStateForTests(): void {
   resetPersistenceForTests();
   toolQueue = Promise.resolve();
+  signalToolModes = new WeakMap();
 }
 
-export const zoomInfoInternalsForTests = { callTool, isRateLimited, extractToolPayload, findRecords };
+export const zoomInfoInternalsForTests = { discoverRequiredTools, refreshOneAccount, callTool, isRateLimited, extractToolPayload, findRecords };

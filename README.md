@@ -72,7 +72,7 @@ If connection fails, the integration drawer reports the selected method, the cli
 
 The app connects directly to `https://mcp.zoominfo.com/mcp` with OAuth Authorization Code + PKCE. Access and refresh tokens are encrypted with AES-256-GCM before storage. Local development uses process memory when Redis is absent; production requires Upstash Redis so OAuth state, tokens, account results, and cache entries survive Vercel function cold starts.
 
-Each batch selects up to `ZOOMINFO_REFRESH_ACCOUNT_LIMIT` canonical accounts (default five), prioritizing never-attempted accounts and then the oldest attempts. Failed attempts also rotate through the queue so they cannot block coverage. Selected companies are resolved by exact domain match before Intent, Scoops, and contacts are retrieved. This can consume up to ten company-enrichment credits. Results are cached for 24 hours, and a distributed lock prevents simultaneous refreshes from duplicating spend. **Refresh this account** targets one canonical company and bypasses its cache; it may consume enrichment credits. Partial-source failures and last failed refreshes are shown on the account. Recommended contacts are resolved without paid contact enrichment, and email or phone data is never requested or stored.
+Each batch selects up to `ZOOMINFO_REFRESH_ACCOUNT_LIMIT` canonical accounts (default five), prioritizing never-attempted accounts and then the oldest attempts. Failed attempts also rotate through the queue so they cannot block coverage. Selected companies are resolved by exact domain match before signals and contacts are retrieved. Discovery prefers `enrich_company_signals`, which replaces `enrich_intent` and `enrich_scoops`; the legacy pair remains supported. Discovery follows all MCP tool-list pages. Legacy signal calls are estimated at two company enrichments per uncached account. For the unified endpoint, consult ZoomInfo usage for actual charges; the application does not assume the old credit estimate applies. Results are cached for 24 hours, and a distributed lock prevents simultaneous refreshes from duplicating spend. **Refresh this account** targets one canonical company and bypasses its cache; it may consume enrichment credits. Partial-source failures, limited signal snapshots, and last failed refreshes are shown on the account. Unified results are matched to the requested company ID and filtered locally by resolved intent topics, score, lookback window, and relevant scoop types. Recommended contacts are resolved without paid contact enrichment, and email or phone data is never requested or stored.
 
 ### Vercel production setup
 
@@ -130,3 +130,7 @@ With MCP mode and credentials configured, verify that the diagnostics drawer rea
 ## Phase two
 
 Add approved Aberdeen credentials, Microsoft Graph warmth, a lightweight Dataverse/Fabric record, pursuit status tracking, and a production Slack notifier. Add authenticated roles and audit logs before using non-demo relationship data.
+
+### ZoomInfo tool migration
+
+ZoomInfo documents `enrich_company_signals` as the replacement for its old Intent and Scoops enrichments: https://gtm.ai/docs/mcp/tools/enrich-company-signals. If reconnect reports missing `enrich_intent` / `enrich_scoops`, deploy this compatibility update, then reconnect. No client-secret change is needed solely for this tool-name migration.
