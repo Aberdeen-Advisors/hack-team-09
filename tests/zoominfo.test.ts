@@ -119,16 +119,15 @@ describe("ZoomInfo MCP normalization", () => {
     expect(rows.every((account) => account.signal.type === "No current signal")).toBe(true);
   });
 
-  it("keeps the Aberdeen warm path when ZoomInfo supplies its own contacts", () => {
+  it("removes seeded warm paths when ZoomInfo supplies observed contacts", () => {
     const signal = buildSignalFromToolResults("draftkings", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
     const contact = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data" }, "123", 1)!;
     applyZoomInfoUpdates([{ canonicalCompanyId: "draftkings", zoominfoCompanyId: "789", signal, buyers: [contact] }]);
 
     const account = getSessionAccounts().find((item) => item.id === "draftkings")!;
-    // ZoomInfo knows nothing about Aberdeen's relationships, so replacing the buyer list
-    // outright silently erased the warm path and the relationship points that go with it.
+    // Seeded warm paths are not relationship evidence.
     expect(account.buyers.map((buyer) => buyer.name)).toContain("Jordan Example");
-    expect(account.buyers.some((buyer) => buyer.warmth === "Warm")).toBe(true);
+    expect(account.buyers.some((buyer) => buyer.warmth === "Warm")).toBe(false);
     // Unknown-warmth seeded placeholders are superseded by the real named contact.
     expect(account.buyers.filter((buyer) => buyer.warmth === "Unknown")).toHaveLength(1);
   });
@@ -146,15 +145,15 @@ describe("ZoomInfo MCP normalization", () => {
     expect(account.firmographics?.employeeCount).toBe(900);
   });
 
-  it("leaves seeded revenue alone when ZoomInfo has no figure", () => {
+  it("clears seeded revenue when ZoomInfo has no figure", () => {
     const signal = buildSignalFromToolResults("meta", {}, {}, new Date("2026-08-13T12:00:00.000Z"));
     const profile = buildCompanyProfile({ name: "Meta Platforms, Inc.", employeeCount: 70_000 });
     applyZoomInfoUpdates([{ canonicalCompanyId: "meta", zoominfoCompanyId: "555", signal, buyers: [], profile }]);
 
     const account = getSessionAccounts().find((item) => item.id === "meta")!;
-    expect(account.revenueMillions).toBe(164000);
-    expect(account.revenueRange).toBe("$100B+");
-    expect(account.source.provenance).toBe("demo");
+    expect(account.revenueMillions).toBeNull();
+    expect(account.revenueRange).toBe("Not verified");
+    expect(account.source.provenance).toBe("verified");
   });
 });
 

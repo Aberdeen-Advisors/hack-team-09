@@ -751,7 +751,7 @@ export function buildSignalFromToolResults(accountId: string, intentPayload: unk
     source: { label: "ZoomInfo licensed signal", url: absoluteUrl(selected.url), observedAt: now.toISOString(), provenance: "verified" },
     date: selected.date,
     relevantIntent: candidates.some((candidate) => candidate.relevantIntent),
-    activeWithin90Days: true,
+    activeWithin90Days: candidates.some((candidate) => Date.parse(candidate.date) >= now.getTime() - 90 * 86400000),
     transformationEvidence: candidates.some((candidate) => candidate.transformationEvidence),
     mergerOrAcquisition: candidates.some((candidate) => candidate.mergerOrAcquisition),
     evidence,
@@ -824,24 +824,49 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
   ]);
   // Reporting "no current signal" when both sources errored would misrepresent a
   // failed lookup as a verified absence of triggers.
-  if (intentResult.status === "rejected" && scoopsResult.status === "rejected") throw scoopsResult.reason;
+  if ((intentResult.status === "rejected" || !topics.length) && scoopsResult.status === "rejected") throw scoopsResult.reason;
   const intentPayload = intentResult.status === "fulfilled" ? intentResult.value : {};
   const scoopsPayload = scoopsResult.status === "fulfilled" ? scoopsResult.value : {};
   const buyers = buyersResult.status === "fulfilled" ? buyersResult.value : [];
-  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal: buildSignalFromToolResults(account.id, intentPayload, scoopsPayload), buyers, profile: buildCompanyProfile(company.record) };
+  const signal = buildSignalFromToolResults(account.id, intentPayload, scoopsPayload);
+  const warnings: string[] = [];
+  if (!topics.length || intentResult.status === "rejected") {
+    warnings.push("Intent lookup unavailable; intent coverage is incomplete.");
+    if (!signal.relevantIntent) signal.relevantIntent = null;
+  }
+  if (scoopsResult.status === "rejected") {
+    warnings.push("Scoops lookup failed; business-event coverage is incomplete.");
+    if (!signal.mergerOrAcquisition) signal.mergerOrAcquisition = null;
+    if (!signal.transformationEvidence) signal.transformationEvidence = null;
+  }
+  if (warnings.length && signal.type === "No current signal") {
+    signal.summary = "No qualifying trigger in the available results; some signal sources were unavailable.";
+    signal.whyNow = "Retry the missing sources before concluding that there is no current trigger.";
+    signal.activeWithin90Days = null;
+  }
+  if (buyersResult.status === "rejected") warnings.push("Contact lookup failed; any previously observed contacts need rechecking.");
+  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal, buyers, profile: buildCompanyProfile(company.record), buyersFailed: buyersResult.status === "rejected", warnings };
 }
 
-function refreshCandidates(items: Account[]): Account[] {
+export function refreshCandidates(items: Account[], accountId?: string): Account[] {
   const representatives = new Map<string, Account>();
-  for (const account of items) if (!representatives.has(account.canonicalCompanyId) || account.duplicateOf === undefined) representatives.set(account.canonicalCompanyId, account);
-  const limit = Math.max(1, Math.min(19, Number(process.env.ZOOMINFO_REFRESH_ACCOUNT_LIMIT || 5)));
-  return [...representatives.values()].sort((a, b) => scoreAccount(b).total - scoreAccount(a).total || a.name.localeCompare(b.name)).slice(0, limit);
+  for (const account of items) if (!representatives.has(account.canonicalCompanyId) || !account.duplicateOf) representatives.set(account.canonicalCompanyId, account);
+  if (accountId) {
+    const target = items.find((item) => item.id === accountId);
+    if (!target) throw new Error("Account not found");
+    return [representatives.get(target.canonicalCompanyId)!];
+  }
+  const limit = Math.max(1, Math.min(representatives.size, Number(process.env.ZOOMINFO_REFRESH_ACCOUNT_LIMIT || 5)));
+  // Least recently attempted first rotates failures too. An untouched seed always gets
+  // a chance before a previously queried or cached account.
+  const attemptedAt = (account: Account) => Date.parse(account.enrichment?.lastAttemptedAt || (account.signal.source.provenance === "verified" ? account.signal.source.observedAt : "")) || 0;
+  return [...representatives.values()].sort((a, b) => attemptedAt(a) - attemptedAt(b) || scoreAccount(b).total - scoreAccount(a).total || a.name.localeCompare(b.name)).slice(0, limit);
 }
 
 // Bump when a refresh starts capturing fields the cached payload does not carry, otherwise a
 // warm cache keeps serving the older, thinner shape until its TTL expires and the new data
 // never reaches the workspace. v2 added company firmographics and full signal evidence.
-const CACHE_SHAPE_VERSION = "v2";
+const CACHE_SHAPE_VERSION = "v3";
 
 function cacheKey(account: Account, topics: string[]): string {
   return `${CACHE_SHAPE_VERSION}|${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
@@ -860,7 +885,7 @@ export class ZoomInfoRefreshInProgressError extends Error {
   constructor() { super("A ZoomInfo refresh is already running"); }
 }
 
-export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; summary: ZoomInfoRefreshSummary }> {
+export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ accounts: Account[]; summary: ZoomInfoRefreshSummary }> {
   const snapshot = await zoomInfoIntegrationSnapshot(true);
   if (zoomInfoMode() !== "mcp") throw new Error("ZoomInfo MCP mode is not enabled");
   if (snapshot.state !== "ready") throw new Error(snapshot.error || "Connect ZoomInfo before refreshing live signals");
@@ -874,7 +899,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
     await discoverRequiredTools(client);
     const { topics, note: intentNote } = await resolveIntentTopics(client);
     const currentAccounts = await loadAccounts();
-    const candidates = refreshCandidates(currentAccounts);
+    const candidates = refreshCandidates(currentAccounts, accountId);
     const ttlMs = Number(process.env.ZOOMINFO_CACHE_TTL_MINUTES || 1440) * 60_000;
     const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
     const updates: ZoomInfoAccountUpdate[] = [];
@@ -887,7 +912,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
       const results = await Promise.allSettled(batch.map(async (account) => {
         const key = cacheKey(account, topics);
         const entry = await persistence.getCompanyCache(account.canonicalCompanyId);
-        if (entry && entry.expiresAt > Date.now() && entry.key === key) return { update: entry.update, cached: true, expiresAt: entry.expiresAt };
+        if (!accountId && entry && entry.expiresAt > Date.now() && entry.key === key) return { update: entry.update, cached: true, expiresAt: entry.expiresAt };
         const update = await refreshOneAccount(client, accountSchema.parse(account), topics);
         const expiresAt = Date.now() + ttlMs;
         await persistence.saveCompanyCache(account.canonicalCompanyId, { update, expiresAt, key }, ttlSeconds);
@@ -904,17 +929,21 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
         }
       });
     }
+    const attemptedAt = new Date().toISOString();
+    const failureByCanonical = new Map(failures.map((failure) => [currentAccounts.find((item) => item.id === failure.accountId)!.canonicalCompanyId, failure.message]));
+    const attemptedAccounts = currentAccounts.map((account) => failureByCanonical.has(account.canonicalCompanyId) ? { ...account, enrichment: { ...account.enrichment, lastAttemptedAt: attemptedAt, error: failureByCanonical.get(account.canonicalCompanyId), warnings: account.enrichment?.warnings || [] } } : account);
     if (!updates.length) {
+      await persistence.saveAccounts(attemptedAccounts);
       // Naming a single account read as one company's problem when in fact every
       // candidate failed, which pointed debugging at the wrong thing.
       const distinct = [...new Set(failures.map((failure) => failure.message))];
       const message = failures.length
         ? `All ${failures.length} ZoomInfo accounts failed to refresh. ${distinct.slice(0, 3).join(" | ")}${distinct.length > 3 ? ` | and ${distinct.length - 3} more` : ""}`
         : "ZoomInfo refresh returned no usable account data";
-      await persistence.updateZoomInfoMeta({ error: message });
+      await persistence.updateZoomInfoMeta({ lastRefreshNote: message });
       throw new Error(message);
     }
-    const updatedAccounts = await applyAndPersistZoomInfoUpdates(updates, currentAccounts);
+    const updatedAccounts = await applyAndPersistZoomInfoUpdates(updates, attemptedAccounts);
     await persistence.updateZoomInfoMeta({
       lastSuccessfulRefreshAt: new Date().toISOString(),
       cacheExpiresAt: cacheExpirations.length ? new Date(Math.min(...cacheExpirations)).toISOString() : undefined,
@@ -926,7 +955,7 @@ export async function refreshZoomInfoAccounts(): Promise<{ accounts: Account[]; 
       summary: { selected: candidates.length, updated: updates.length, cached, unchanged: new Set(updatedAccounts.map((account) => account.canonicalCompanyId)).size - updates.length, failed: failures, estimatedCompanyCredits: queried * 2 },
     };
   } catch (error) {
-    await persistence.updateZoomInfoMeta({ error: friendlyError(error) });
+    await persistence.updateZoomInfoMeta({ lastRefreshNote: friendlyError(error) });
     throw error;
   } finally {
     if (connection) await closeClient(connection.client, connection.transport);

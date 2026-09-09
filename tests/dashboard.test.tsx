@@ -1,5 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { liveAccount } from "./fixtures";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "@/components/dashboard";
 import { listAccountDetails } from "@/lib/repository";
 import type { IntegrationStatus } from "@/lib/schemas";
@@ -16,6 +17,8 @@ const status: IntegrationStatus = {
     { provider: "ZoomInfo", mode: "mock", status: "ready", configured: false, message: "Seeded signals active.", checkedAt: "2026-08-13T12:00:00.000Z" },
   ],
 };
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("workspace navigation", () => {
   beforeAll(() => {
@@ -62,5 +65,51 @@ describe("workspace navigation", () => {
     expect(screen.getByRole("button", { name: "Connect ZoomInfo to refresh" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
     expect(screen.getByRole("button", { name: "Connect ZoomInfo" })).toBeEnabled();
+  });
+});
+
+
+describe("live outreach workflow", () => {
+  it("generates on entry and preserves edited drafts when refreshed evidence changes", async () => {
+    const account = liveAccount();
+    const details = listAccountDetails([account]);
+    const refreshed = structuredClone(account);
+    refreshed.signal.summary = "Updated investment announcement";
+    refreshed.signal.source.observedAt = "2026-09-08T13:00:00Z";
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ draft: details[0].outreach }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ details: listAccountDetails([refreshed]), refresh: { updated: 1, cached: 0, failed: [], estimatedCompanyCredits: 2 } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Dashboard initialDetails={details} initialStatus={status} metrics={{ rows: 1, canonicalAccounts: 1, pursueNow: 0 }} initialStage="pursuit" />);
+    fireEvent.click(screen.getByRole("button", { name: /Draft outreach/ }));
+    await waitFor(() => expect(screen.getByLabelText("Editable outreach email")).toBeEnabled());
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/accounts/draftkings/draft-outreach");
+    fireEvent.change(screen.getByLabelText("Editable outreach email"), { target: { value: "My carefully edited email" } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh signals" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Prioritize/ })).toHaveAttribute("aria-selected", "true"));
+    fireEvent.click(screen.getByRole("tab", { name: /Outreach/ }));
+    expect(screen.getByLabelText("Editable outreach email")).toHaveValue("My carefully edited email");
+    expect(screen.getByText(/Your draft has been preserved/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy draft" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows pending research and targets the selected account for refresh", async () => {
+    const details = listAccountDetails();
+    const liveStatus: IntegrationStatus = { ...status, demoMode: false, diagnostics: [{ provider: "ZoomInfo", mode: "live", status: "ready", configured: true, message: "Ready", checkedAt: "2026-09-08" }], zoomInfo: { state: "ready", requiredToolsReady: true, liveAccounts: 0, totalCanonicalAccounts: 19 } };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ details }) });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Dashboard initialDetails={details} initialStatus={liveStatus} metrics={{ rows: 20, canonicalAccounts: 19, pursueNow: 0 }} initialAccountId="meta" initialStage="prioritize" />);
+    expect(screen.queryByText("Demo transformation signal requiring confirmation from a licensed signal provider.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh this account" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ accountId: "meta" });
+  });
+
+  it("does not generate outreach for an account without an observed trigger", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Dashboard initialDetails={listAccountDetails()} initialStatus={status} metrics={{ rows: 20, canonicalAccounts: 19, pursueNow: 0 }} initialStage="outreach" />);
+    expect(screen.getByRole("button", { name: "Regenerate" })).toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { loadAccounts } from "@/lib/session-store";
 import { accounts } from "@/lib/data";
 import { validRequestOrigin } from "@/lib/admin-auth";
 import { integrationStatus, providers } from "@/lib/providers";
@@ -11,17 +13,20 @@ export const maxDuration = 60;
 
 export async function POST(request: NextRequest) {
   if (!validRequestOrigin(request)) return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
+  const body = z.object({ accountId: z.string().min(1).optional() }).safeParse(await request.json().catch(() => ({})));
+  if (!body.success) return NextResponse.json({ error: "Invalid refresh request" }, { status: 400 });
+  if (body.data.accountId && !(await loadAccounts()).some((account) => account.id === body.data.accountId)) return NextResponse.json({ error: "Account not found" }, { status: 404 });
   if (zoomInfoMode() === "mcp") {
     const before = await zoomInfoIntegrationSnapshot(true);
     if (before.state !== "ready") return NextResponse.json({ error: before.error || "Connect ZoomInfo before refreshing live signals", status: await integrationStatus(true) }, { status: 409 });
     try {
-      const result = await refreshZoomInfoAccounts();
+      const result = await refreshZoomInfoAccounts(body.data.accountId);
       const details = listAccountDetails(result.accounts);
       return NextResponse.json({
         signalCount: result.summary.updated,
         deduplicatedRows: result.accounts.length - new Set(result.accounts.map((account) => account.canonicalCompanyId)).size,
         fallback: false,
-        featuredAccountId: details[0]?.account.id,
+        featuredAccountId: body.data.accountId || details[0]?.account.id,
         details,
         metrics: accountMetrics(result.accounts),
         refresh: result.summary,
@@ -29,7 +34,8 @@ export async function POST(request: NextRequest) {
       });
     } catch (error) {
       const status = error instanceof ZoomInfoRefreshInProgressError ? 409 : 502;
-      return NextResponse.json({ error: error instanceof Error ? error.message : "ZoomInfo refresh failed", status: await integrationStatus(true) }, { status });
+      const latest = await loadAccounts();
+      return NextResponse.json({ error: error instanceof Error ? error.message : "ZoomInfo refresh failed", details: listAccountDetails(latest), metrics: accountMetrics(latest), status: await integrationStatus(true) }, { status });
     }
   }
   const selected = providers();
@@ -39,7 +45,7 @@ export async function POST(request: NextRequest) {
     signalCount: signals.length,
     deduplicatedRows: accounts.length - signals.length,
     fallback: false,
-    featuredAccountId: details[0]?.account.id,
+    featuredAccountId: body.data.accountId || details[0]?.account.id,
     details,
     metrics: accountMetrics(),
     refresh: { selected: signals.length, updated: signals.length, cached: 0, unchanged: 0, failed: [], estimatedCompanyCredits: 0 },

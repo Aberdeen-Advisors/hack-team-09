@@ -6,3 +6,7 @@ coverage/
 npm-debug.log*
 *.tsbuildinfo
 
+
+test-results/
+playwright-report/
+debug.log

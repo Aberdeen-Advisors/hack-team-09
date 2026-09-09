@@ -78,18 +78,18 @@ describe("pursuit tab reads ZoomInfo insights", () => {
     const recommendation = matchOfferingMock(withZoomInfoInsights("draftkings"), offerings);
 
     expect(recommendation.provenance).toBe("inferred");
-    expect(recommendation.assumptions[0]).toContain("ZoomInfo verified the trigger");
+    expect(recommendation.assumptions[0]).toContain("ZoomInfo observed the trigger");
     // The proof point is still synthetic and must keep saying so.
     expect(recommendation.assumptions.join(" ")).toContain("synthetic");
   });
 
-  it("leaves a seeded account's recommendation unchanged", () => {
+  it("requires research before recommending an offering from seeded evidence", () => {
     const seeded = accountSchema.parse(accounts.find((item) => item.id === "draftkings")!);
     const recommendation = matchOfferingMock(seeded, offerings);
 
-    expect(recommendation.provenance).toBe("demo");
-    expect(recommendation.recommendedOffering).toBe("Rapid AI Product Studio");
-    expect(recommendation.assumptions[0]).toContain("demo data");
+    expect(recommendation.provenance).toBe("unknown");
+    expect(recommendation.recommendedOffering).toBe("Research required");
+    expect(recommendation.confidence).toBe(0);
   });
 
   it("lets the observed topics move the match off the plain signal-type default", () => {

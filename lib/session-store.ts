@@ -14,6 +14,8 @@ export type ZoomInfoAccountUpdate = {
   signal: Signal;
   buyers: Buyer[];
   profile?: ZoomInfoCompanyProfile;
+  buyersFailed?: boolean;
+  warnings?: string[];
 };
 
 type SessionStore = {
@@ -46,16 +48,17 @@ export async function loadAccounts(): Promise<Account[]> {
   return store().accounts;
 }
 
-// ZoomInfo can name real contacts but knows nothing about Aberdeen's own relationships, so
-// a refresh that simply replaced the buyer list erased every warm path and silently cost the
-// account its relationship score. Aberdeen relationship rows are kept alongside the live
-// contacts; no warmth is transferred onto a ZoomInfo-named person, which would be a guess.
-function mergeBuyers(account: Account, incoming: Buyer[]): Buyer[] {
-  if (!incoming.length) return account.buyers;
-  const live = incoming.map((buyer, index) => ({ ...buyer, id: `${account.id}-zoominfo-buyer-${index + 1}` }));
-  const liveNames = new Set(live.map((buyer) => buyer.name.toLowerCase()));
-  const relationships = account.buyers.filter((buyer) => buyer.warmth !== "Unknown" && !liveNames.has(buyer.name.toLowerCase()));
-  return [...live, ...relationships];
+// Provider contact identity and internally verified relationships are separate evidence.
+export function mergeBuyers(account: Account, incoming: Buyer[], failed = false): Buyer[] {
+  const relationships = account.buyers.filter((buyer) => buyer.relationshipProvenance === "verified");
+  // Retain previously observed contacts only on a failed lookup, never demo personas.
+  const contacts = failed ? account.buyers.filter((buyer) => buyer.source.provenance === "verified") : incoming;
+  // Stable provider IDs keep identity separate from a person's mutable name or list rank.
+  const ids = new Set(contacts.map((buyer) => buyer.id));
+  return [...contacts.map((buyer) => {
+    const relationship = relationships.find((item) => item.id === buyer.id);
+    return relationship ? { ...buyer, warmth: relationship.warmth, relationshipSource: relationship.relationshipSource, relationshipProvenance: relationship.relationshipProvenance, suggestedPath: relationship.suggestedPath } : buyer;
+  }), ...relationships.filter((buyer) => !ids.has(buyer.id))];
 }
 
 function applyProfile(account: Account, update: ZoomInfoAccountUpdate): Partial<Account> {
@@ -66,12 +69,11 @@ function applyProfile(account: Account, update: ZoomInfoAccountUpdate): Partial<
   return {
     legalName: legalName || account.legalName,
     industry: firmographics.industry || account.industry,
-    // A ZoomInfo revenue figure is verified where the seeded one was demo research, so it
-    // replaces the seed. When ZoomInfo has no figure the seeded value is left untouched.
-    revenueMillions: revenueMillions === null ? account.revenueMillions : revenueMillions,
-    revenueRange: revenueMillions === null ? account.revenueRange : revenueRange || account.revenueRange,
+    // A missing provider revenue remains unknown; do not silently reuse demo revenue.
+    revenueMillions,
+    revenueRange: revenueMillions === null ? "Not verified" : revenueRange || "Not verified",
     firmographics,
-    source: revenueMillions === null ? account.source : { label: "ZoomInfo company profile", url: account.website, observedAt: firmographics.source.observedAt, provenance: "verified" as const },
+    source: { label: "ZoomInfo company profile", url: account.website, observedAt: firmographics.source.observedAt, provenance: "verified" as const },
   };
 }
 
@@ -85,7 +87,8 @@ export function applyZoomInfoUpdatesToAccounts(accounts: Account[], updates: Zoo
       ...applyProfile(account, update),
       providerIds: { ...account.providerIds, zoominfoCompanyId: update.zoominfoCompanyId },
       signal: { ...update.signal, accountId: account.id },
-      buyers: mergeBuyers(account, update.buyers),
+      buyers: mergeBuyers(account, update.buyers, update.buyersFailed),
+      enrichment: { lastAttemptedAt: new Date().toISOString(), lastSuccessfulAt: update.signal.source.observedAt, warnings: update.warnings || [] },
     });
   });
 }

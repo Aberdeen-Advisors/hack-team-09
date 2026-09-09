@@ -22,7 +22,7 @@ describe("ICP scoring", () => {
   it("awards warm relationship points only when supported", () => {
     const draftKings = scoreAccount(accounts.find((account) => account.id === "draftkings")!);
     const riot = scoreAccount(accounts.find((account) => account.id === "riot-games")!);
-    expect(draftKings.components.find((item) => item.key === "relationship")?.earned).toBe(10);
+    expect(draftKings.components.find((item) => item.key === "relationship")?.earned).toBe(0);
     expect(riot.components.find((item) => item.key === "relationship")?.earned).toBe(0);
   });
 });

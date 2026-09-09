@@ -9,13 +9,18 @@ export default defineConfig({
   reporter: "list",
   outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR,
   webServer: {
-    command: "npm run dev -- -H 127.0.0.1 -p 4317",
+    command: `"${process.execPath}" node_modules/next/dist/bin/next dev --webpack -H 127.0.0.1 -p 4317`,
     env: {
       ...process.env,
       ZOOMINFO_PROVIDER: "mock",
+      OPENAI_USE_MOCK: "true",
+      UPSTASH_REDIS_REST_URL: "",
+      UPSTASH_REDIS_REST_TOKEN: "",
+      KV_REST_API_URL: "",
+      KV_REST_API_TOKEN: "",
     },
     url: "http://127.0.0.1:4317",
-    reuseExistingServer: true,
+    reuseExistingServer: false,
     timeout: 120_000,
   },
   use: {

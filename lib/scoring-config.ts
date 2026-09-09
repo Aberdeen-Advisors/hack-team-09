@@ -3,7 +3,7 @@ export const ICP_SCORING = {
   transformation: { label: "Transformation roadmap or active initiative", points: 20 },
   mergerAcquisition: { label: "Recent merger or acquisition activity", points: 15 },
   intent: { label: "Relevant intent or buying signal", points: 20 },
-  budget: { label: "Budget or active initiative within 90 days", points: 15 },
+  budget: { label: "Observed trigger within 90 days", points: 15 },
   relationship: { label: "Warm Aberdeen relationship", points: 10 },
 } as const;
 

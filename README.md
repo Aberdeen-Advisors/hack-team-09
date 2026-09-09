@@ -21,7 +21,7 @@ Copy-Item .env.example .env.local
 npm run dev
 ```
 
-Open `http://localhost:3000`. The default configuration is fully functional in demo mode.
+Open `http://localhost:3000`. The default configuration shows the target-account queue with unverified seed data. Seed evidence earns zero points and does not support outreach; connect ZoomInfo and refresh accounts to use the complete workflow.
 
 Validation commands:
 
@@ -41,7 +41,7 @@ See `.env.example`. All secrets remain server-side.
 
 ### OpenAI
 
-Set `OPENAI_USE_MOCK=false`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL` (default `gpt-5.4-mini`). The app uses the Responses API with strict structured output and validates every response with Zod. Failed or invalid responses fall back to the deterministic mock provider.
+Set `OPENAI_USE_MOCK=false`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL` (default `gpt-5.4-mini`). Outreach uses the Responses API with strict structured output and validates every response with Zod. Failed or invalid responses fall back to an evidence-based template with a visible warning. With `OPENAI_USE_MOCK=true`, those same templates use ZoomInfo evidence without calling OpenAI. Offering recommendations use consistent evidence-based rules in Pursuit, Outreach, and Slack.
 
 ### ZoomInfo MCP
 
@@ -72,7 +72,7 @@ If connection fails, the integration drawer reports the selected method, the cli
 
 The app connects directly to `https://mcp.zoominfo.com/mcp` with OAuth Authorization Code + PKCE. Access and refresh tokens are encrypted with AES-256-GCM before storage. Local development uses process memory when Redis is absent; production requires Upstash Redis so OAuth state, tokens, account results, and cache entries survive Vercel function cold starts.
 
-Each uncached refresh resolves all canonical company identities with free search, then enriches Intent and Scoops for at most five accounts. This can consume up to ten company-enrichment credits. Results are cached for 24 hours, and a distributed lock prevents simultaneous refreshes from duplicating spend. Recommended contacts are resolved without paid contact enrichment, and email or phone data is never requested or stored.
+Each batch selects up to `ZOOMINFO_REFRESH_ACCOUNT_LIMIT` canonical accounts (default five), prioritizing never-attempted accounts and then the oldest attempts. Failed attempts also rotate through the queue so they cannot block coverage. Selected companies are resolved by exact domain match before Intent, Scoops, and contacts are retrieved. This can consume up to ten company-enrichment credits. Results are cached for 24 hours, and a distributed lock prevents simultaneous refreshes from duplicating spend. **Refresh this account** targets one canonical company and bypasses its cache; it may consume enrichment credits. Partial-source failures and last failed refreshes are shown on the account. Recommended contacts are resolved without paid contact enrichment, and email or phone data is never requested or stored.
 
 ### Vercel production setup
 
@@ -97,15 +97,16 @@ Paste the client secret carefully: a trailing newline picked up from the Vercel 
 
 Generate the encryption key locally with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Generate the session secret independently. Never commit either value. After deployment, visitors can view the shared account snapshot, but only the signed-in administrator can connect or disconnect ZoomInfo or refresh signals.
 
-## Demo script
+## Integrated workflow
 
-1. Open the dashboard and point out Demo Mode plus the ranked account queue.
-2. Click **Refresh signals**. The app refreshes 19 canonical companies from 20 rows and reports the duplicate suppression.
-3. Open the top-ranked account and review Why Now plus the explainable score.
-4. Click **Map buyer and offering** to show relationship warmth, assumptions, TEAM stage, and 4E fit.
-5. Click **Draft outreach**, select a tone, regenerate, edit, and copy the draft.
-6. Show the Slack preview and integration diagnostics drawer.
-7. Select “Marriott Vacations Worldwide Corporation” to demonstrate duplicate detection and canonical grouping.
+1. Connect ZoomInfo, then refresh successive batches to research the account queue. Use **Refresh this account** for a targeted update.
+2. In Prioritize, review observed signals, firmographics, and the evidence behind each score. Unresearched accounts show a research-pending state in live mode.
+3. In Pursuit, review verified contacts, inferred decision roles, and the offering selected by evidence-based rules. Relationship warmth requires independently verified internal evidence; ZoomInfo contact identity alone earns no relationship points.
+4. Open Outreach to generate a draft automatically. Select a verified recipient and tone, then regenerate as needed. Both AI and template drafts use observed evidence, and account-level intent is treated as a topic to validate rather than proof of a funded initiative.
+5. Edit and copy the draft after review. A refresh preserves edits in the open workspace; changed evidence or recipient selection marks the draft outdated and disables copying until regeneration. Draft edits are not persisted across page reloads.
+6. Review the Slack preview. No email or Slack message is sent.
+
+Accounts with no qualifying observed trigger stay in research and cannot generate outreach. Synthetic credentials are excluded; approved Aberdeen proof points must come from the internal offering catalog.
 
 ## Data replacement
 
@@ -117,15 +118,15 @@ Generate the encryption key locally with `node -e "console.log(require('crypto')
 ## Known limitations
 
 - Public company identities are seeded, but company facts, signals, relationships, and proof points are demo research or synthetic unless explicitly labeled verified.
-- Buyer cards represent role hypotheses, not verified named contacts.
+- Buyer cards use observed ZoomInfo contacts after refresh. Decision roles remain inferred; internal relationship evidence must be verified separately.
 - The app previews but does not send email or Slack messages.
 - No CRM synchronization, historical analytics, multi-user role management, or long-term historical reporting.
 - The production account snapshot is shared by all viewers; only one administrator identity controls the ZoomInfo connection.
 
 ## Manual ZoomInfo smoke test
 
-With MCP mode and credentials configured, verify that the diagnostics drawer reaches `ready`, the required tools are reported available, and a refresh updates up to five accounts with `verified` ZoomInfo provenance. Repeat the refresh and confirm the toast reports cached accounts and zero estimated credits. Disconnect ZoomInfo and confirm another live refresh is blocked without replacing the last visible data with demo content.
+With MCP mode and credentials configured, verify that the diagnostics drawer reaches `ready`, the required tools are reported available, and a refresh updates up to five accounts with `verified` ZoomInfo provenance. Repeat batches until all canonical accounts have been attempted, then confirm cached results are reused. Targeted account refreshes deliberately bypass cache. Disconnect ZoomInfo and confirm another live refresh is blocked without replacing the last visible data with demo content.
 
 ## Phase two
 
-Connect the licensed ZoomInfo mapper, approved Aberdeen credentials, Microsoft Graph warmth, a lightweight Dataverse/Fabric record, pursuit status tracking, and a production Slack notifier. Add authenticated roles and audit logs before using non-demo relationship data.
+Add approved Aberdeen credentials, Microsoft Graph warmth, a lightweight Dataverse/Fabric record, pursuit status tracking, and a production Slack notifier. Add authenticated roles and audit logs before using non-demo relationship data.

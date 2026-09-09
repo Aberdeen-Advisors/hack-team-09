@@ -1,5 +1,5 @@
 import { offerings, uniqueCanonicalAccountCount } from "@/lib/data";
-import { createSlackAlert, generateOutreachMock, matchOfferingMock } from "@/lib/recommendations";
+import { createSlackAlert, generateOutreachTemplate, matchOffering } from "@/lib/recommendations";
 import { scoreAccount } from "@/lib/scoring";
 import { getSessionAccounts } from "@/lib/session-store";
 import type { Account, AccountDetail, OutreachDraft } from "@/lib/schemas";
@@ -12,8 +12,8 @@ export function getAccountDetail(id: string, tone: OutreachDraft["tone"] = "Dire
   const account = items.find((item) => item.id === id);
   if (!account) return undefined;
   const score = scoreAccount(account);
-  const recommendation = matchOfferingMock(account, offerings);
-  const outreach = generateOutreachMock(account, recommendation, tone);
+  const recommendation = matchOffering(account, offerings);
+  const outreach = generateOutreachTemplate(account, recommendation, tone);
   const slack = createSlackAlert(account, score.total, recommendation);
   return { account, score, recommendation, outreach, slack };
 }

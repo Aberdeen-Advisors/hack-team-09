@@ -98,6 +98,12 @@ export const accountSchema = z.object({
   buyers: z.array(buyerSchema),
   firmographics: firmographicsSchema.optional(),
   providerIds: z.object({ zoominfoCompanyId: z.string().optional() }).optional(),
+  enrichment: z.object({
+    lastAttemptedAt: z.string(),
+    lastSuccessfulAt: z.string().optional(),
+    error: z.string().optional(),
+    warnings: z.array(z.string()).default([]),
+  }).optional(),
   duplicateOf: z.string().optional(),
 });
 export type Account = z.infer<typeof accountSchema>;
@@ -172,13 +178,18 @@ export const offeringRecommendationSchema = z.object({
 });
 export type OfferingRecommendation = z.infer<typeof offeringRecommendationSchema>;
 
-export const outreachDraftSchema = z.object({
+export const outreachContentSchema = z.object({
   subject: z.string(),
   body: z.string(),
   tone: z.enum(["Direct", "Relationship-led", "Executive"]),
   wordCount: z.number(),
   warnings: z.array(z.string()),
   provenance: provenanceSchema,
+});
+export const outreachDraftSchema = outreachContentSchema.extend({
+  generationMethod: z.enum(["template", "ai"]).default("template"),
+  evidenceKey: z.string().default(""),
+  recipientId: z.string().nullable().default(null),
 });
 export type OutreachDraft = z.infer<typeof outreachDraftSchema>;
 

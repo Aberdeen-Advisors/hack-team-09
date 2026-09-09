@@ -1,3 +1,4 @@
+import { evidenceKey, groundedAccount, hasCurrentSignal, verifiedWarmBuyer } from "@/lib/evidence";
 import type { Account, Offering, OfferingRecommendation, OutreachDraft, SlackAlert } from "@/lib/schemas";
 
 const STOPWORDS = new Set(["and", "the", "for", "with", "a", "an", "of", "to", "in", "on", "ai"]);
@@ -29,17 +30,27 @@ function evidenceLines(account: Account): string[] {
   ];
 }
 
-export function matchOfferingMock(account: Account, offerings: Offering[]): OfferingRecommendation {
+export function matchOffering(account: Account, offerings: Offering[]): OfferingRecommendation {
+  account = groundedAccount(account);
   // Stable sort keeps catalog order as the tiebreak, so an account with no evidence resolves
   // to the same offering the plain signal-type match used to produce.
   const offering = [...offerings].sort((a, b) => rankOffering(account, b) - rankOffering(account, a))[0];
-  const credential = offering.credentials[0];
+  const credential = offering.credentials.find((item) => item.provenance === "verified" && !item.replacementRequired);
   const live = account.signal.source.provenance === "verified";
+  if (!hasCurrentSignal(account)) return {
+    recommendedOffering: "Research required", offeringId: "", buyerProblem: "Confirm a current business priority before recommending an offering.",
+    fitRationale: live ? "No qualifying current trigger supports an offering recommendation." : "Refresh this account to establish a current signal before matching an offering.",
+    suggestedLeadMessage: "Keep this account in research until there is a supported reason to engage.",
+    supportingCredential: "No approved proof point selected.", confidence: 0,
+    evidenceUsed: live ? [account.signal.summary] : [],
+    assumptions: ["Budget, ownership, and timing are unconfirmed.", "A current signal is required before drafting outreach."],
+    provenance: live ? "inferred" : "unknown",
+  };
   const { intentTopics, scoops } = account.signal.evidence;
   const topics = intentTopics.slice(0, 3).map((item) => item.topic);
   const evidence = evidenceLines(account);
-  const firmographicLine = account.firmographics
-    ? `ZoomInfo firmographics: ${[account.revenueRange, account.firmographics.employeeCount ? `${account.firmographics.employeeCount.toLocaleString()} employees` : undefined, account.firmographics.hqLocation].filter(Boolean).join(" · ")}`
+  const firmographicLine = account.firmographics?.source.provenance === "verified"
+    ? `ZoomInfo firmographics: ${[account.firmographics.revenueMillions != null ? account.revenueRange : undefined, account.firmographics.employeeCount ? `${account.firmographics.employeeCount.toLocaleString()} employees` : undefined, account.firmographics.hqLocation].filter(Boolean).join(" · ")}`
     : undefined;
 
   const fitRationale = topics.length
@@ -58,7 +69,7 @@ export function matchOfferingMock(account: Account, offerings: Offering[]): Offe
     fitRationale,
     buyerProblem: offering.businessProblems[0],
     suggestedLeadMessage,
-    supportingCredential: credential.statement,
+    supportingCredential: credential?.statement || "No approved Aberdeen proof point is available for this offering.",
     // Confidence rises with how much corroborating evidence the refresh actually returned
     // rather than being a fixed pair of constants.
     confidence: Math.min(0.92, (live ? 0.72 : 0.6) + Math.min(evidence.length, 4) * 0.05),
@@ -66,46 +77,54 @@ export function matchOfferingMock(account: Account, offerings: Offering[]): Offe
     // sharing a summary would otherwise collide.
     evidenceUsed: [...new Set([...evidence, firmographicLine, evidence.length ? undefined : account.signal.summary, account.industry, offering.outcome].filter((item): item is string => Boolean(item)))],
     assumptions: [
-      live ? "ZoomInfo verified the trigger; budget, ownership, and timing are still unconfirmed." : "The signal is demo data until ZoomInfo validates it.",
+      live ? "ZoomInfo observed the trigger; budget, ownership, and timing are still unconfirmed." : "The signal is demo data until ZoomInfo validates it.",
       account.buyers.some((buyer) => buyer.source.provenance === "verified") ? "Buyer identities come from ZoomInfo recommendations; their involvement in this initiative is unconfirmed." : "Buyer names and timing require confirmation.",
-      "The supporting proof point is synthetic and must be replaced.",
+      credential ? "The supporting credential is approved." : "No approved proof point is available; synthetic credentials are excluded.",
     ],
     // Rule-derived from verified inputs is an inference, not a verified recommendation.
     provenance: live ? "inferred" : "demo",
   };
 }
 
-const toneOpeners = {
-  Direct: "I’m reaching out because",
-  "Relationship-led": "I wanted to share a thought after seeing",
-  Executive: "A timely question for your leadership team:",
-} as const;
-
-export function generateOutreachMock(account: Account, recommendation: OfferingRecommendation, tone: OutreachDraft["tone"]): OutreachDraft {
-  const warmBuyer = account.buyers.find((buyer) => buyer.warmth === "Warm");
-  const relationshipLine = tone === "Relationship-led" && warmBuyer
-    ? `Our team has a seeded demo relationship path through ${warmBuyer.relationshipSource.split(":")[0]}, which may offer helpful context. `
-    : "";
-  const body = `${toneOpeners[tone]} ${account.name}'s ${account.signal.type.toLowerCase()} activity may create a practical window to turn AI ambition into a measurable next step. ${account.signal.whyNow}\n\n${relationshipLine}Aberdeen's ${recommendation.recommendedOffering} is designed to address ${recommendation.buyerProblem.toLowerCase()} with a focused, senior-led approach. We would begin by validating the priority, the evidence already available, and the smallest useful outcome—not by prescribing a large program.\n\nIf this is on your agenda, would a 25-minute working session next week be useful? We can compare the trigger against a simple opportunity scorecard and decide whether there is enough evidence to act.\n\nBest,\nMichael`;
-  const wordCount = body.trim().split(/\s+/).length;
-  return {
-    subject: `${account.name}: a practical next step on ${account.signal.type.toLowerCase()}`,
-    body,
-    tone,
-    wordCount,
-    warnings: ["Demo draft - verify all company facts and recipient details.", "Synthetic proof points are intentionally omitted from the email body."],
-    provenance: "demo",
+export function generateOutreachTemplate(account: Account, recommendation: OfferingRecommendation, tone: OutreachDraft["tone"]): OutreachDraft {
+  const live = hasCurrentSignal(account);
+  const metadata = { generationMethod: "template" as const, evidenceKey: evidenceKey(account), recipientId: account.buyers.find((item) => item.source.provenance === "verified")?.id ?? null };
+  if (!live) return {
+    ...metadata, subject: "Research required", body: "", tone, wordCount: 0,
+    warnings: ["A current observed signal is required before drafting outreach."],
+    provenance: account.signal.source.provenance === "demo" ? "demo" : "unknown",
   };
+  const buyer = account.buyers.find((item) => item.source.provenance === "verified");
+  const scoop = account.signal.evidence.scoops[0];
+  const topic = account.signal.evidence.intentTopics[0];
+  const clip = (value: string, words: number) => value.split(/\s+/).slice(0, words).join(" ");
+  // Keep intent observations internal: they suggest a topic to validate, not proof of
+  // a funded project or something the recipient personally researched.
+  const hook = scoop
+    ? `I saw the ${scoop.date} update about ${account.name}: ${clip(scoop.summary, 24).replace(/[.!?]+$/, "")}. Is this creating new priorities for your team?`
+    : `Is ${clip(topic?.topic || account.signal.type, 12)} a current priority at ${account.name}? I wanted to ask rather than assume the timing or scope of any initiative.`;
+  const warm = verifiedWarmBuyer(account.buyers);
+  const relationship = tone === "Relationship-led" && warm ? "We have an existing connection through our teams and would welcome your perspective. " : "";
+  const opener = tone === "Executive" ? "A question about your priorities: " : "";
+  const body = `${buyer ? `Hello ${buyer.name},` : "Hello,"}\n\n${opener}${hook}\n\n${relationship}Aberdeen's ${recommendation.recommendedOffering} could offer a focused way to explore ${recommendation.buyerProblem.toLowerCase()}. We would start by understanding the business outcome, the evidence already available, and the constraints your team is working within. The aim would be to identify one practical next step before considering a broader engagement.\n\n${buyer ? `Given your role as ${clip(buyer.title, 8)}, would` : "Would"} a 25-minute conversation next week be useful to compare priorities and see whether there is a fit? If someone else owns this area, I would appreciate being pointed in the right direction.\n\nBest,\nMichael`;
+  return { ...metadata, subject: `${account.name}: ${clip(topic?.topic || account.signal.type, 8)} priorities`, body, tone,
+    wordCount: body.trim().split(/\s+/).length,
+    warnings: ["Please verify recipient details and review the supporting evidence before sending.", ...(!buyer ? ["No verified recipient selected; buyer research is required."] : []), ...(account.enrichment?.warnings || [])], provenance: "inferred" };
 }
 
+// Compatibility exports for existing integrations; these are evidence-based rules/templates.
+export const matchOfferingMock = matchOffering;
+export const generateOutreachMock = generateOutreachTemplate;
+
 export function createSlackAlert(account: Account, score: number, recommendation: OfferingRecommendation): SlackAlert {
+  const buyer = account.buyers.find((item) => item.source.provenance === "verified");
   return {
     account: account.name,
-    signal: account.signal.summary,
+    signal: account.signal.source.provenance === "verified" ? account.signal.summary : "Signal research required",
     score,
-    recommendedBuyer: account.buyers[0] ? (account.buyers[0].source.provenance === "verified" ? `${account.buyers[0].name} — ${account.buyers[0].title}` : account.buyers[0].title) : "Buyer research required",
+    recommendedBuyer: buyer ? `${buyer.name} / ${buyer.title}` : "Buyer research required",
     recommendedOffering: recommendation.recommendedOffering,
     reviewUrl: `/?account=${account.id}&stage=prioritize`,
-    provenance: "demo",
+    provenance: account.signal.source.provenance === "verified" ? "inferred" : "unknown",
   };
 }

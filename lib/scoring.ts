@@ -26,11 +26,11 @@ export function categoryForScore(score: number): ScoreResult["category"] {
 }
 
 export function scoreAccount(account: Account): ScoreResult {
-  const revenue = account.revenueMillions;
-  const revenueVerified = revenue !== null;
+  const revenue = account.firmographics ? account.firmographics.revenueMillions ?? null : account.revenueMillions;
+  const revenueVerified = revenue !== null && (account.firmographics?.source ?? account.source).provenance === "verified";
   const revenueInRange = revenueVerified && revenue >= ICP_SCORING.revenue.minMillions && revenue <= ICP_SCORING.revenue.maxMillions;
-  const warm = account.buyers.some((buyer) => buyer.warmth === "Warm");
-  const relationshipVerified = account.buyers.some((buyer) => buyer.warmth !== "Unknown");
+  const warm = account.buyers.some((buyer) => buyer.warmth === "Warm" && buyer.relationshipProvenance === "verified");
+  const relationshipVerified = account.buyers.some((buyer) => buyer.warmth !== "Unknown" && buyer.relationshipProvenance === "verified");
   // Every explanation names its own source, so a reviewer can tell a live ZoomInfo
   // observation apart from seeded demo research without leaving the score card.
   const live = account.signal.source.provenance === "verified";
@@ -47,15 +47,15 @@ export function scoreAccount(account: Account): ScoreResult {
       earned: revenueInRange ? ICP_SCORING.revenue.points : 0,
       verified: revenueVerified,
       explanation: !revenueVerified
-        ? "Not verified."
+        ? account.revenueMillions === null ? "Not verified." : "Seeded demo research or missing source verification; no revenue points awarded."
         : revenueInRange
           ? `${revenueSource}: ${account.revenueRange} is within the Aberdeen ICP band.`
           : `${revenueSource}: ${account.revenueRange} is outside the $50M-$5B ICP band.`,
     },
-    booleanComponent("transformation", ICP_SCORING.transformation.label, ICP_SCORING.transformation.points, account.signal.transformationEvidence, scoopTypes ? `ZoomInfo scoops indicate a transformation initiative (${scoopTypes}).` : "The active signal indicates a transformation initiative."),
-    booleanComponent("mergerAcquisition", ICP_SCORING.mergerAcquisition.label, ICP_SCORING.mergerAcquisition.points, account.signal.mergerOrAcquisition, "The signal includes current M&A activity."),
-    booleanComponent("intent", ICP_SCORING.intent.label, ICP_SCORING.intent.points, account.signal.relevantIntent, topTopics ? `ZoomInfo intent topics scoring above threshold: ${topTopics}.` : "A relevant buying signal is present."),
-    booleanComponent("budget", ICP_SCORING.budget.label, ICP_SCORING.budget.points, account.signal.activeWithin90Days, live ? `ZoomInfo observed the trigger on ${account.signal.date}, inside the lookback window.` : "Demo evidence indicates an active initiative inside 90 days."),
+    booleanComponent("transformation", ICP_SCORING.transformation.label, ICP_SCORING.transformation.points, live ? account.signal.transformationEvidence : null, scoopTypes ? `ZoomInfo evidence suggests a transformation priority (${scoopTypes}); confirm the initiative.` : "The observed signal suggests a transformation priority; confirm the initiative."),
+    booleanComponent("mergerAcquisition", ICP_SCORING.mergerAcquisition.label, ICP_SCORING.mergerAcquisition.points, live ? account.signal.mergerOrAcquisition : null, "The signal includes current M&A activity."),
+    booleanComponent("intent", ICP_SCORING.intent.label, ICP_SCORING.intent.points, live ? account.signal.relevantIntent : null, topTopics ? `ZoomInfo intent topics scoring above threshold: ${topTopics}.` : "A relevant buying signal is present."),
+    booleanComponent("budget", ICP_SCORING.budget.label, ICP_SCORING.budget.points, live ? account.signal.activeWithin90Days : null, `ZoomInfo observed the trigger on ${account.signal.date}. Recency does not establish budget.`),
     {
       key: "relationship",
       label: ICP_SCORING.relationship.label,
@@ -64,7 +64,7 @@ export function scoreAccount(account: Account): ScoreResult {
       verified: relationshipVerified,
       explanation: !relationshipVerified
         ? "Not verified. ZoomInfo names contacts but holds no Aberdeen relationship history."
-        : warm ? "Seeded relationship data includes a warm Aberdeen path." : "No warm relationship is supported by current data.",
+        : warm ? "Verified internal relationship evidence supports a warm Aberdeen path." : "No warm relationship is supported by current data.",
     },
   ];
 

@@ -1,8 +1,16 @@
+import { liveAccount } from "../tests/fixtures";
+import { listAccountDetails } from "../lib/repository";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
-test("laptop demo journey reaches outreach in two guided advances", async ({ page }, testInfo) => {
+test("laptop journey carries ZoomInfo evidence through all three stages", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const details = listAccountDetails([liveAccount()]);
+  const status = { demoMode: false, diagnostics: [{ provider: "ZoomInfo", mode: "live", status: "ready", configured: true, message: "Fixture connection", checkedAt: "2026-09-08" }, { provider: "OpenAI", mode: "mock", status: "ready", configured: false, message: "Templates", checkedAt: "2026-09-08" }], zoomInfo: { state: "ready", requiredToolsReady: true, liveAccounts: 1, totalCanonicalAccounts: 1 } };
+  await page.route("**/api/signals/refresh", (route) => route.fulfill({ json: { details, status, featuredAccountId: "draftkings", metrics: { rows: 1, canonicalAccounts: 1, pursueNow: 0 }, refresh: { updated: 1, cached: 0, failed: [], estimatedCompanyCredits: 0 } } }));
+  await page.route("**/api/accounts/draftkings/draft-outreach", (route) => route.fulfill({ json: { draft: details[0].outreach, fallback: false } }));
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Who to call today" })).toBeVisible();
@@ -16,6 +24,10 @@ test("laptop demo journey reaches outreach in two guided advances", async ({ pag
   await page.getByRole("button", { name: /Draft outreach/ }).click();
   await expect(page.getByRole("tab", { name: /Outreach/ })).toHaveAttribute("aria-selected", "true");
 
+  await expect(page.getByLabel("Editable outreach email")).toBeEnabled();
+  await expect(page.getByLabel("Editable outreach email")).toHaveValue(/Announced a new growth investment/);
+  await expect(page.locator("main")).not.toContainText("Demo data");
+  expect(errors).toEqual([]);
   const draft = await page.getByLabel("Editable outreach email").inputValue();
   const wordCount = draft.trim().split(/\s+/).filter(Boolean).length;
   expect(wordCount).toBeGreaterThanOrEqual(100);
