@@ -6,6 +6,7 @@ import Link from "next/link";
 import { ListEnrichment, type WorkspaceUpdate } from "@/components/list-enrichment";
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, ChevronRight, Clipboard, ExternalLink, LoaderCircle, Mail, Phone, RefreshCw, Settings2, Signal as SignalIcon, Sparkles, Users, X } from "lucide-react";
 import { evidenceKey, hasCurrentSignal, verifiedWarmBuyer } from "@/lib/evidence";
+import { normalizeLinkedInProfileUrl } from "@/lib/contact-details";
 import type { Account, AccountDetail, Buyer, IntegrationStatus, OutreachDraft, WorkspaceStage, TargetList } from "@/lib/schemas";
 
 type DashboardProps = { initialDetails: AccountDetail[]; initialStatus: IntegrationStatus; metrics: { rows: number; canonicalAccounts: number; pursueNow: number }; initialAccountId?: string; initialStage: WorkspaceStage; targetList?: TargetList };
@@ -15,12 +16,19 @@ const warmthClass = (warmth: string) => warmth === "Warm" ? "warm" : warmth === 
 type BuyerResearch = NonNullable<NonNullable<Account["enrichment"]>["buyerResearch"]>;
 const buyerResearchCounts = (research: BuyerResearch) => `Recommendations ${research.recommendationsReturned} · usable IDs ${research.usableContactIds} · contacts hydrated ${research.contactsHydrated} · rejected ${research.contactsRejected}`;
 
+function LinkedInLogo() {
+  return <svg data-testid="linkedin-logo" viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true" focusable="false">
+    <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.352V9h3.414v1.561h.047c.476-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 1 1 0-4.124 2.062 2.062 0 0 1 0 4.124zM7.119 20.452H3.555V9H7.12v11.452z" />
+  </svg>;
+}
+
 function BuyerContactActions({ buyer, onCopy }: { buyer: Buyer; onCopy: (label: "Email" | "Phone", value: string) => void }) {
-  if (!buyer.email && !buyer.phone && !buyer.linkedinUrl) return null;
+  const linkedinProfileUrl = normalizeLinkedInProfileUrl(buyer.linkedinUrl);
+  if (!buyer.email && !buyer.phone && !linkedinProfileUrl) return null;
   return <div className="buyer-contact-actions" aria-label={`Contact details for ${buyer.name}`}>
     {buyer.email && <button type="button" className="contact-action" aria-label={`Copy email for ${buyer.name}`} title="Copy email" onClick={() => onCopy("Email", buyer.email!)}><Mail size={15} /></button>}
     {buyer.phone && <button type="button" className="contact-action" aria-label={`Copy phone for ${buyer.name}`} title="Copy phone" onClick={() => onCopy("Phone", buyer.phone!)}><Phone size={15} /></button>}
-    {buyer.linkedinUrl && <a className="contact-action" href={buyer.linkedinUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open LinkedIn profile for ${buyer.name}`} title="Open LinkedIn profile"><ExternalLink size={15} /></a>}
+    {linkedinProfileUrl && <a className="contact-action" href={linkedinProfileUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open LinkedIn profile for ${buyer.name}`} title="Open LinkedIn profile"><LinkedInLogo /></a>}
   </div>;
 }
 

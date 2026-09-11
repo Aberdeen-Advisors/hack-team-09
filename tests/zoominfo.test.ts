@@ -60,9 +60,14 @@ describe("ZoomInfo MCP normalization", () => {
   });
 
   it("keeps verified business contact details and normalizes LinkedIn URLs", () => {
-    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", email: "jordan@example.com", phone: "+1 555-0100", externalUrls: [{ type: "LinkedIn", url: "linkedin.com/in/jordan-example" }] }, "123", 1, new Date("2026-08-13T12:00:00.000Z"));
+    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", email: "jordan@example.com", phone: "+1 555-0100", externalUrls: [{ type: "LinkedIn", url: "https://www.linkedin.com" }, { type: "LinkedIn", url: "linkedin.com/in/jordan-example" }] }, "123", 1, new Date("2026-08-13T12:00:00.000Z"));
 
     expect(buyer).toMatchObject({ name: "Jordan Example", title: "VP, Data", email: "jordan@example.com", phone: "+1 555-0100", linkedinUrl: "https://linkedin.com/in/jordan-example", warmth: "Unknown", decisionRoleProvenance: "inferred", relationshipProvenance: "unknown" });
+  });
+
+  it("omits LinkedIn homepage and feed URLs when no person profile is available", () => {
+    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", externalUrls: ["https://linkedin.com", "https://www.linkedin.com/feed/"] }, "123", 1);
+    expect(buyer).not.toHaveProperty("linkedinUrl");
   });
 
   it("drops malformed contact details instead of failing buyer normalization", () => {

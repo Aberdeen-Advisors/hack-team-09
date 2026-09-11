@@ -96,7 +96,16 @@ describe("workspace navigation", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Email copied.");
     fireEvent.click(screen.getByRole("button", { name: "Copy phone for Jordan Example" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("+1 555-0100"));
-    expect(screen.getByRole("link", { name: "Open LinkedIn profile for Jordan Example" })).toHaveAttribute("href", "https://www.linkedin.com/in/jordan-example");
+    const linkedinLink = screen.getByRole("link", { name: "Open LinkedIn profile for Jordan Example" });
+    expect(linkedinLink).toHaveAttribute("href", "https://www.linkedin.com/in/jordan-example");
+    expect(linkedinLink.querySelector("svg[data-testid='linkedin-logo']")).toBeInTheDocument();
+  });
+
+  it("does not render a LinkedIn action for a saved non-profile URL", () => {
+    const account = liveAccount();
+    account.buyers[0] = { ...account.buyers[0], linkedinUrl: "https://www.linkedin.com/feed/" };
+    render(<Dashboard initialDetails={listAccountDetails([account])} initialStatus={status} metrics={{ rows: 1, canonicalAccounts: 1, pursueNow: 1 }} initialStage="pursuit" />);
+    expect(screen.queryByRole("link", { name: "Open LinkedIn profile for Jordan Example" })).not.toBeInTheDocument();
   });
 });
 

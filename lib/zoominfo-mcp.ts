@@ -10,6 +10,7 @@ import {
   type StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
 import { accountSchema, buyerSchema, firmographicsSchema, signalSchema, type Account, type Buyer, type BuyerResearchDiagnostic, type Firmographics, type Signal } from "@/lib/schemas";
+import { normalizeLinkedInProfileUrl } from "@/lib/contact-details";
 import { appPersistence, redisConfigured, resetPersistenceForTests, type AppPersistence, type PendingOAuth } from "@/lib/persistence";
 import { scoreAccount } from "@/lib/scoring";
 import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate, type ZoomInfoCompanyProfile } from "@/lib/session-store";
@@ -931,12 +932,8 @@ function normalizedLinkedInUrl(record: UnknownRecord): string | undefined {
     .flatMap((key) => collectStrings(record[key]));
   const external = collectStrings(record.externalUrls ?? record.externalURLs);
   for (const candidate of [...direct, ...external]) {
-    if (!/linkedin\.com/i.test(candidate)) continue;
-    try {
-      const url = new URL(/^https?:\/\//i.test(candidate) ? candidate : `https://${candidate.replace(/^\/+/, "")}`);
-      const hostname = url.hostname.toLowerCase();
-      if (hostname === "linkedin.com" || hostname.endsWith(".linkedin.com")) return url.toString();
-    } catch { /* Ignore malformed provider URLs. */ }
+    const profileUrl = normalizeLinkedInProfileUrl(candidate);
+    if (profileUrl) return profileUrl;
   }
   return undefined;
 }
