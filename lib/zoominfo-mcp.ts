@@ -20,7 +20,8 @@ type SignalToolMode = "unified" | "legacy";
 let signalToolModes = new WeakMap<Client, SignalToolMode>();
 type ContactToolContract = { recommendationSchema?: unknown; resolverName: "enrich_contacts" | "search_contacts"; resolverSchema?: unknown };
 let contactToolContracts = new WeakMap<Client, ContactToolContract>();
-const DEFAULT_TOPIC_QUERIES = ["artificial intelligence", "generative AI", "digital transformation", "cloud migration", "data analytics"];
+let lookupToolSchemas = new WeakMap<Client, unknown>();
+const DEFAULT_TOPIC_QUERIES = ["AI", "digital transformation", "data"];
 const RELEVANT_SCOOP_TYPES = ["Funding", "Mergers & Acquisitions (M&A)", "New Hire", "Promotion", "Management Move", "Executive Move", "Project", "Pain Point", "Partnership", "Product Launch", "Facilities Relocation / Expansion"];
 
 type UnknownRecord = Record<string, unknown>;
@@ -221,10 +222,6 @@ async function closeClient(client: Client, transport: StreamableHTTPClientTransp
   try { await client.close(); } catch { /* already closed */ }
 }
 
-// ZoomInfo does not publish argument shapes for its MCP tools, so the server's own
-// declared schema is the only authoritative description of what `lookup` accepts.
-let lookupSchemaSummary: string | undefined;
-
 function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefined {
   const schema = asRecord(tool.inputSchema);
   const properties = asRecord(schema?.properties);
@@ -240,6 +237,7 @@ function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefine
 async function discoverRequiredTools(client: Client): Promise<void> {
   signalToolModes.delete(client);
   contactToolContracts.delete(client);
+  lookupToolSchemas.delete(client);
   const listed: Awaited<ReturnType<Client["listTools"]>>["tools"] = [];
   let cursor: string | undefined;
   const seenCursors = new Set<string>();
@@ -255,7 +253,8 @@ async function discoverRequiredTools(client: Client): Promise<void> {
   const mode = names.includes("enrich_company_signals") ? "unified"
     : names.includes("enrich_intent") && names.includes("enrich_scoops") ? "legacy" : undefined;
   if (!mode) missing.push("enrich_company_signals (or both legacy enrich_intent and enrich_scoops)");
-  lookupSchemaSummary = summarizeToolSchema(listed.find((tool) => tool.name === "lookup") ?? {});
+  const lookupTool = listed.find((tool) => tool.name === "lookup");
+  lookupToolSchemas.set(client, lookupTool?.inputSchema);
   let contactContract: ContactToolContract | undefined;
   const contactSchemaErrors: string[] = [];
   for (const resolverName of ["enrich_contacts", "search_contacts"] as const) {
@@ -551,6 +550,15 @@ function recommendedContactArgs(contract: ContactToolContract, companyId: string
 }
 
 function contactResolverArgs(contract: ContactToolContract, personId: string): UnknownRecord {
+  const properties = schemaProperties(contract.resolverSchema);
+  if (properties && Object.hasOwn(properties, "contacts")) {
+    const args: UnknownRecord = { contacts: [{ personId }] };
+    // ZoomInfo defaults to returning email when requiredFields is omitted. Request
+    // only the professional identity fields needed for a selectable recipient.
+    if (Object.hasOwn(properties, "requiredFields")) args.requiredFields = ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId"];
+    if (Object.hasOwn(properties, "userIntent")) args.userIntent = "Resolve a recommended business contact's name and title only; do not return email or phone data.";
+    return args;
+  }
   const candidates = ["personId", "zoominfoContactId", "contactId", "personIds", "zoominfoContactIds", "contactIds"];
   const key = schemaKey(contract.resolverSchema, candidates, "personId");
   const args: UnknownRecord = { [key]: schemaValue(contract.resolverSchema, key, personId) };
@@ -696,13 +704,42 @@ function topicQueries(): string[] {
   return (process.env.ZOOMINFO_INTENT_TOPIC_QUERIES || DEFAULT_TOPIC_QUERIES.join(",")).split(",").map((value) => value.trim()).filter(Boolean).slice(0, 50);
 }
 
-function collectStringArray(value: unknown, key: string): string[] {
-  if (Array.isArray(value)) return value.flatMap((item) => collectStringArray(item, key));
+function collectIntentTopicNames(value: unknown, inTopicCollection = false): string[] {
+  if (typeof value === "string") return inTopicCollection && value.trim() ? [value.trim()] : [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectIntentTopicNames(item, inTopicCollection));
   const record = asRecord(value);
   if (!record) return [];
-  const direct = record[key];
-  const directValues = Array.isArray(direct) ? direct.filter((item): item is string => typeof item === "string") : [];
-  return [...directValues, ...Object.values(record).flatMap((nested) => nested && typeof nested === "object" ? collectStringArray(nested, key) : [])];
+  const attributes = asRecord(record.attributes);
+  const type = stringValue(record, ["type"])?.toLowerCase();
+  if (type === "intenttopic") {
+    const topic = stringValue(record, ["id", "topic", "name", "value", "label"])
+      || (attributes ? stringValue(attributes, ["name", "topic", "value", "label"]) : undefined);
+    return topic ? [topic] : [];
+  }
+  if (inTopicCollection) {
+    const topic = stringValue(record, ["topic", "name", "value", "label"]);
+    if (topic) return [topic];
+  }
+  const topicKeys = new Set(["intent-topics", "topicDetails", "topics", "data", "results", "records"]);
+  return Object.entries(record).flatMap(([key, nested]) => nested && typeof nested === "object"
+    ? collectIntentTopicNames(nested, inTopicCollection || topicKeys.has(key))
+    : topicKeys.has(key) ? collectIntentTopicNames(nested, true) : []);
+}
+
+function intentLookupArgs(schema: unknown, fuzzyMatch: string | string[]): UnknownRecord {
+  const matches = Array.isArray(fuzzyMatch) ? fuzzyMatch : [fuzzyMatch];
+  const properties = schemaProperties(schema);
+  const args: UnknownRecord = {};
+  if (!properties || !Object.keys(properties).length || Object.hasOwn(properties, "fields")) {
+    args.fields = matches.map((value) => ({ fieldName: "intent-topics", fuzzyMatch: value }));
+  } else if (Object.hasOwn(properties, "fieldName")) {
+    args.fieldName = "intent-topics";
+    if (Object.hasOwn(properties, "fuzzyMatch")) args.fuzzyMatch = matches[0];
+  } else {
+    throw new Error("ZoomInfo lookup schema is missing fields or fieldName");
+  }
+  if (!properties || !Object.keys(properties).length || Object.hasOwn(properties, "userIntent")) args.userIntent = "Resolve approved intent topics for Aberdeen signal monitoring.";
+  return args;
 }
 
 // Returns the resolved topics plus, when resolution failed, a note explaining why.
@@ -710,22 +747,28 @@ function collectStringArray(value: unknown, key: string): string[] {
 // Scoops-only rather than failing it outright.
 async function resolveIntentTopics(client: Client): Promise<{ topics: string[]; note?: string }> {
   const queries = topicQueries();
-  let payload: unknown;
+  const schema = lookupToolSchemas.get(client);
+  const schemaSummary = summarizeToolSchema({ inputSchema: schema });
+  let payloads: unknown[];
   try {
-    payload = await callTool(client, "lookup", { fields: queries.map((fuzzyMatch) => ({ fieldName: "intent-topics", fuzzyMatch })), userIntent: "Resolve approved intent topics for Aberdeen signal monitoring." });
+    const properties = schemaProperties(schema);
+    payloads = properties && Object.keys(properties).length && !Object.hasOwn(properties, "fields") && Object.hasOwn(properties, "fieldName")
+      ? await Promise.all(queries.map((query) => callTool(client, "lookup", intentLookupArgs(schema, query))))
+      : [await callTool(client, "lookup", intentLookupArgs(schema, queries))];
   } catch (error) {
-    return { topics: [], note: `ZoomInfo intent topic lookup failed, so signals came from Scoops only: ${friendlyError(error)}${lookupSchemaSummary ? ` [lookup accepts ${lookupSchemaSummary}]` : ""}` };
+    return { topics: [], note: `ZoomInfo intent topic lookup failed, so signals came from Scoops only: ${friendlyError(error)}${schemaSummary ? ` [lookup accepts ${schemaSummary}]` : ""}` };
   }
-  const records = findRecords(payload, ["topicDetails", "topics", "results", "data", "records"]);
-  const topics = records.flatMap((record) => {
-    const value = stringValue(record, ["topic", "name", "value", "label"]);
-    return value ? [value] : [];
-  });
-  topics.push(...collectStringArray(payload, "topics"));
-  const unique = [...new Set(topics)].slice(0, 50);
+  const topics = payloads.flatMap((payload) => collectIntentTopicNames(payload));
+  const seen = new Set<string>();
+  const unique = topics.filter((topic) => {
+    const normalized = topic.toLowerCase();
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  }).slice(0, 50);
   if (unique.length) return { topics: unique };
-  const shape = Object.keys(asRecord(payload) ?? {}).join(", ") || typeof payload;
-  return { topics: [], note: `ZoomInfo lookup returned no intent topics for ${queries.join(", ")}, so signals came from Scoops only. Response contained: ${shape}.${lookupSchemaSummary ? ` Lookup accepts ${lookupSchemaSummary}.` : ""}` };
+  const shape = payloads.map((payload) => Object.keys(asRecord(payload) ?? {}).join(", ") || typeof payload).join("; ");
+  return { topics: [], note: `ZoomInfo lookup returned no intent topics for ${queries.join(", ")}, so signals came from Scoops only. Response contained: ${shape}.${schemaSummary ? ` Lookup accepts ${schemaSummary}.` : ""}` };
 }
 
 type SignalCandidate = { id: string; type: Signal["type"]; summary: string; url?: string; date: string; intentScore: number; relevantIntent: boolean; transformationEvidence: boolean; mergerOrAcquisition: boolean; topic?: string; scoopType?: string };
@@ -859,17 +902,26 @@ export function normalizeBuyerFromContact(record: UnknownRecord, personId: strin
 type BuyerLookupResult = { buyers: Buyer[]; diagnostic: BuyerResearchDiagnostic; preserveExisting: boolean };
 
 function contactIdentityRecord(record: UnknownRecord): UnknownRecord {
+  const attributes = asRecord(record.attributes);
+  let identity = attributes ? { ...record, ...attributes, id: record.id ?? attributes.id } : record;
   for (const key of ["contact", "person", "recommendedContact", "profile"]) {
-    const nested = flattenRecord(record[key]);
-    if (nested) return { ...record, ...nested };
+    const nested = asRecord(record[key]);
+    if (nested) identity = { ...identity, ...contactIdentityRecord(nested) };
   }
-  return record;
+  return identity;
 }
 
 function explicitContactCollection(value: unknown, preferredKeys: string[]): UnknownRecord[] | undefined {
-  if (Array.isArray(value)) return value.map(flattenRecord).filter((item): item is UnknownRecord => Boolean(item));
+  if (Array.isArray(value)) {
+    const collected = value.flatMap((item) => explicitContactCollection(item, preferredKeys) ?? []);
+    return collected.length ? collected : [];
+  }
   const record = asRecord(value);
   if (!record) return undefined;
+  const identity = contactIdentityRecord(record);
+  if (stringValue(identity, ["zoominfoContactId", "personId", "contactId", "id"])
+    || stringValue(identity, ["fullName", "name", "firstName"])
+    || stringValue(identity, ["jobTitle", "title"])) return [identity];
   for (const key of preferredKeys) {
     if (!Object.hasOwn(record, key)) continue;
     const found = explicitContactCollection(record[key], preferredKeys);
@@ -1197,6 +1249,7 @@ export function resetZoomInfoStateForTests(): void {
   toolQueue = Promise.resolve();
   signalToolModes = new WeakMap();
   contactToolContracts = new WeakMap();
+  lookupToolSchemas = new WeakMap();
 }
 
-export const zoomInfoInternalsForTests = { discoverRequiredTools, refreshOneAccount, fetchBuyers, callTool, isRateLimited, extractToolPayload, findRecords };
+export const zoomInfoInternalsForTests = { discoverRequiredTools, refreshOneAccount, fetchBuyers, resolveIntentTopics, callTool, isRateLimited, extractToolPayload, findRecords };

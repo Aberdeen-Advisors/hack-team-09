@@ -114,6 +114,28 @@ describe("buyer contact resolution", () => {
     expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_contacts", arguments: { personIds: [22] } }, expect.anything());
   });
 
+  it("preserves the current recommendation ID beside attributes and requests only safe identity fields", async () => {
+    const currentEnrichSchema = {
+      contacts: { type: "array", items: { type: "object" } },
+      requiredFields: { type: "array", items: { type: "string" } },
+      userIntent: { type: "string" },
+    };
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: contactTools("enrich_contacts", currentEnrichSchema) }),
+      callTool: vi.fn(async ({ name }: { name: string }) => name === "get_recommended_contacts"
+        ? { structuredContent: { recommendations: [{ zoominfoContactId: 13728122400, attributes: { rank: 1, score: 0.84, recommendedPersonBrief: "Director, Data" } }] } }
+        : { structuredContent: { data: [{ status: "success", data: { person: { personId: "13728122400", firstName: "Casey", lastName: "Example", jobTitle: "Director, Data" } } }] } }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result.buyers[0]).toMatchObject({ name: "Casey Example", title: "Director, Data" });
+    expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_contacts", arguments: {
+      contacts: [{ personId: "13728122400" }],
+      requiredFields: ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId"],
+      userIntent: expect.any(String),
+    } }, expect.anything());
+  });
+
   it("falls back to search_contacts when the available enrich schema is incompatible", async () => {
     const tools = [...contactTools(), { name: "enrich_contacts", inputSchema: { type: "object" as const, properties: { matchPersonInput: { type: "array" } } } }];
     const client = {
@@ -157,6 +179,51 @@ describe("buyer contact resolution", () => {
     await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
     const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
     expect(result).toMatchObject({ buyers: [], preserveExisting: true, diagnostic: { status: "failed", recommendationsReturned: 1, usableContactIds: 1, contactsHydrated: 0, contactsRejected: 1 } });
+  });
+});
+
+describe("intent topic lookup", () => {
+  function compatibleTools(lookupProperties: Record<string, unknown>) {
+    return [
+      { name: "lookup", inputSchema: { type: "object" as const, properties: lookupProperties } },
+      ...toolList(["search_companies", "get_recommended_contacts", "search_contacts", "enrich_company_signals"]),
+    ];
+  }
+
+  it("extracts IDs from the current intent-topics response envelope", async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: compatibleTools({ fields: { type: "array" }, userIntent: { type: "string" } }) }),
+      callTool: vi.fn().mockResolvedValue({ structuredContent: { "intent-topics": [
+        { fuzzyMatch: "AI", data: [
+          { id: "AI Copilot", type: "IntentTopic", attributes: { name: "AI Copilot", category: "Artificial Intelligence" } },
+          { id: "AI Governance", type: "IntentTopic", attributes: { name: "AI Governance", category: "Artificial Intelligence" } },
+        ] },
+        { fuzzyMatch: "data", data: [{ id: "Data Transformation", type: "IntentTopic", attributes: { name: "Data Transformation" } }] },
+      ] } }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.resolveIntentTopics(client as never);
+    expect(result).toEqual({ topics: ["AI Copilot", "AI Governance", "Data Transformation"] });
+    expect(client.callTool).toHaveBeenCalledWith({ name: "lookup", arguments: {
+      fields: [
+        { fieldName: "intent-topics", fuzzyMatch: "AI" },
+        { fieldName: "intent-topics", fuzzyMatch: "digital transformation" },
+        { fieldName: "intent-topics", fuzzyMatch: "data" },
+      ],
+      userIntent: expect.any(String),
+    } }, expect.anything());
+  });
+
+  it("adapts to a singular lookup schema", async () => {
+    vi.stubEnv("ZOOMINFO_INTENT_TOPIC_QUERIES", "AI,data");
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: compatibleTools({ fieldName: { type: "string" }, fuzzyMatch: { type: "string" } }) }),
+      callTool: vi.fn(async ({ arguments: args }: { arguments: { fuzzyMatch: string } }) => ({ structuredContent: { topics: [args.fuzzyMatch === "AI" ? "AI Copilot" : "Data Transformation"] } })),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.resolveIntentTopics(client as never);
+    expect(result.topics).toEqual(["AI Copilot", "Data Transformation"]);
+    expect(client.callTool).toHaveBeenCalledTimes(2);
   });
 });
 
