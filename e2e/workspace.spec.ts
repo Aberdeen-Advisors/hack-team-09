@@ -40,6 +40,27 @@ test("laptop journey carries ZoomInfo evidence through all three stages", async 
   await page.screenshot({ path: testInfo.outputPath("laptop-outreach.png"), fullPage: true });
 });
 
+test("buyer map explains an empty ZoomInfo recommendation result", async ({ page }) => {
+  const account = liveAccount();
+  account.buyers = [];
+  account.enrichment = {
+    lastAttemptedAt: "2026-09-10T12:00:00Z",
+    lastSuccessfulAt: "2026-09-10T12:00:00Z",
+    warnings: [],
+    buyerResearch: { status: "empty", recommendationsReturned: 0, usableContactIds: 0, contactsHydrated: 0, contactsRejected: 0, message: "ZoomInfo returned no recommended contacts for this account." },
+  };
+  const details = listAccountDetails([account]);
+  const status = { demoMode: false, diagnostics: [{ provider: "ZoomInfo", mode: "live", status: "ready", configured: true, message: "Fixture connection", checkedAt: "2026-09-10" }], zoomInfo: { state: "ready", requiredToolsReady: true, liveAccounts: 1, totalCanonicalAccounts: 1 } };
+  await page.route("**/api/integrations/status", (route) => route.fulfill({ json: status }));
+  await page.route("**/api/signals/refresh", (route) => route.fulfill({ json: { details, status, featuredAccountId: account.id, metrics: { rows: 1, canonicalAccounts: 1, pursueNow: 0 }, refresh: { updated: 1, cached: 0, failed: [], estimatedCompanyCredits: 0 } } }));
+  await page.goto(`/lists/starter?account=${account.id}`);
+  await page.getByRole("button", { name: "Refresh this account" }).click();
+  await expect(page.getByText(/Recommendations 0 · usable IDs 0 · contacts hydrated 0 · rejected 0/)).toBeVisible();
+  await page.getByRole("button", { name: /Map buyer and offering/ }).click();
+  await expect(page.getByText("ZoomInfo returned no recommended contacts for this account.")).toBeVisible();
+  await expect(page.getByText(/No verified buyer is available/)).toHaveCount(0);
+});
+
 test("narrow layout moves from queue to focused detail without overflow", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/lists/starter");

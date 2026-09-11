@@ -45,6 +45,16 @@ describe("ZoomInfo tool compatibility", () => {
     await expect(zoomInfoInternalsForTests.discoverRequiredTools(client as never)).rejects.toThrow("enrich_company_signals (or both legacy");
     expect((await appPersistence().getZoomInfoMeta()).requiredToolsReady).toBe(false);
   });
+  it("rejects contact tools whose discovered schemas have no supported identifiers", async () => {
+    const tools = [
+      ...toolList(["lookup", "search_companies", "enrich_company_signals"]),
+      { name: "get_recommended_contacts", inputSchema: { type: "object" as const, properties: { unsupportedCompanyKey: { type: "string" } } } },
+      { name: "search_contacts", inputSchema: { type: "object" as const, properties: { unsupportedPersonKey: { type: "string" } } } },
+    ];
+    const client = { listTools: vi.fn().mockResolvedValue({ tools }) };
+    await expect(zoomInfoInternalsForTests.discoverRequiredTools(client as never)).rejects.toThrow("supported contact tool schema");
+    expect((await appPersistence().getZoomInfoMeta()).requiredToolsReady).toBe(false);
+  });
   it("stops repeated pagination cursors", async () => {
     const client = { listTools: vi.fn().mockResolvedValue({ tools: toolList(core), nextCursor: "same" }) };
     await expect(zoomInfoInternalsForTests.discoverRequiredTools(client as never)).rejects.toThrow("repeated page cursor");
@@ -66,6 +76,87 @@ describe("ZoomInfo tool compatibility", () => {
     expect(update.signal.evidence.scoops).toHaveLength(2);
     expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_company_signals", arguments: { zoominfoCompanyIds: [123], signalTypes: ["INTENT", "SCOOP"], userIntent: expect.any(String) } }, expect.anything());
     expect(client.callTool.mock.calls.map(([call]) => call.name)).not.toContain("enrich_intent");
+  });
+});
+
+describe("buyer contact resolution", () => {
+  function contactTools(resolverName: "enrich_contacts" | "search_contacts" = "search_contacts", resolverProperties: Record<string, unknown> = { personId: { type: "string" }, pageSize: { type: "number" }, userIntent: { type: "string" } }) {
+    return [
+      ...toolList(["lookup", "search_companies"]),
+      { name: "get_recommended_contacts", inputSchema: { type: "object" as const, properties: { ziCompanyId: { type: "number" }, useCaseType: { type: "string" }, pageSize: { type: "number" } }, required: ["ziCompanyId"] } },
+      { name: resolverName, inputSchema: { type: "object" as const, properties: resolverProperties } },
+      ...toolList(["enrich_company_signals"]),
+    ];
+  }
+
+  it("uses complete recommendation identity without an unnecessary contact call", async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: contactTools() }),
+      callTool: vi.fn().mockResolvedValue({ structuredContent: { recommendations: [{ personId: "11", fullName: "Jordan Example", jobTitle: "VP, Data" }] } }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result.buyers).toHaveLength(1);
+    expect(result.diagnostic).toMatchObject({ status: "verified", recommendationsReturned: 1, usableContactIds: 1, contactsHydrated: 1, contactsRejected: 0 });
+    expect(client.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers enrich_contacts and shapes an array identifier from its discovered schema", async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: contactTools("enrich_contacts", { personIds: { type: "array", items: { type: "number" } } }) }),
+      callTool: vi.fn(async ({ name }: { name: string }) => name === "get_recommended_contacts"
+        ? { structuredContent: { recommendations: [{ zoominfoContactId: 22 }] } }
+        : { structuredContent: { data: [{ person: { fullName: "Taylor Example", jobTitle: "Chief Data Officer" } }] } }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result.buyers[0]).toMatchObject({ name: "Taylor Example", title: "Chief Data Officer" });
+    expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_contacts", arguments: { personIds: [22] } }, expect.anything());
+  });
+
+  it("falls back to search_contacts when the available enrich schema is incompatible", async () => {
+    const tools = [...contactTools(), { name: "enrich_contacts", inputSchema: { type: "object" as const, properties: { matchPersonInput: { type: "array" } } } }];
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools }),
+      callTool: vi.fn(async ({ name }: { name: string }) => name === "get_recommended_contacts"
+        ? { structuredContent: { recommendations: [{ personId: "23" }] } }
+        : { structuredContent: { contacts: [{ personId: "23", fullName: "Morgan Example", jobTitle: "VP, Technology" }] } }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result.buyers[0].name).toBe("Morgan Example");
+    expect(client.callTool).toHaveBeenCalledWith({ name: "search_contacts", arguments: { personId: "23", pageSize: 1, userIntent: expect.any(String) } }, expect.anything());
+  });
+
+  it("reports an explicit empty recommendation result", async () => {
+    const client = { listTools: vi.fn().mockResolvedValue({ tools: contactTools() }), callTool: vi.fn().mockResolvedValue({ structuredContent: { recommendations: [] } }) };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result).toMatchObject({ buyers: [], preserveExisting: false, diagnostic: { status: "empty", recommendationsReturned: 0, contactsRejected: 0 } });
+  });
+
+  it("counts recommendations that cannot supply a stable ID or complete identity", async () => {
+    const responses = [
+      { structuredContent: { recommendations: [{ fullName: "No Identifier", jobTitle: "VP" }, { personId: "33" }] } },
+      { structuredContent: { contacts: [{ personId: "33", fullName: "Missing Title" }] } },
+    ];
+    const client = { listTools: vi.fn().mockResolvedValue({ tools: contactTools() }), callTool: vi.fn().mockImplementation(async () => responses.shift()) };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result).toMatchObject({ buyers: [], preserveExisting: true, diagnostic: { status: "partial", recommendationsReturned: 2, usableContactIds: 1, contactsHydrated: 0, contactsRejected: 2 } });
+  });
+
+  it("distinguishes a failed resolver from a valid empty result", async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue({ tools: contactTools() }),
+      callTool: vi.fn(async ({ name }: { name: string }) => {
+        if (name === "get_recommended_contacts") return { structuredContent: { recommendations: [{ personId: "44" }] } };
+        throw new Error("provider unavailable");
+      }),
+    };
+    await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
+    const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
+    expect(result).toMatchObject({ buyers: [], preserveExisting: true, diagnostic: { status: "failed", recommendationsReturned: 1, usableContactIds: 1, contactsHydrated: 0, contactsRejected: 1 } });
   });
 });
 

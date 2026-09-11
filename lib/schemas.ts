@@ -70,6 +70,16 @@ export const buyerSchema = z.object({
 });
 export type Buyer = z.infer<typeof buyerSchema>;
 
+export const buyerResearchDiagnosticSchema = z.object({
+  status: z.enum(["verified", "empty", "partial", "failed"]),
+  recommendationsReturned: z.number().int().nonnegative(),
+  usableContactIds: z.number().int().nonnegative(),
+  contactsHydrated: z.number().int().nonnegative(),
+  contactsRejected: z.number().int().nonnegative(),
+  message: z.string(),
+});
+export type BuyerResearchDiagnostic = z.infer<typeof buyerResearchDiagnosticSchema>;
+
 // Company facts ZoomInfo returns alongside the domain match. Present only after a live
 // refresh, which is what lets scoring mark revenue verified instead of seeded research.
 export const firmographicsSchema = z.object({
@@ -103,6 +113,7 @@ export const accountSchema = z.object({
     lastSuccessfulAt: z.string().optional(),
     error: z.string().optional(),
     warnings: z.array(z.string()).default([]),
+    buyerResearch: buyerResearchDiagnosticSchema.optional(),
   }).optional(),
   duplicateOf: z.string().optional(),
 });

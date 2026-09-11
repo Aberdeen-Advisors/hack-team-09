@@ -5,6 +5,9 @@ export default defineConfig({
   timeout: 30_000,
   expect: { timeout: 8_000 },
   fullyParallel: false,
+  // The journeys intentionally mutate the app's in-memory workspace through one shared
+  // dev server. Running spec files concurrently lets one journey replace another's lists.
+  workers: 1,
   retries: 0,
   reporter: "list",
   outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR,

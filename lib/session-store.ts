@@ -1,6 +1,6 @@
 import { accounts as seededAccounts } from "@/lib/data";
 import { appPersistence } from "@/lib/persistence";
-import { accountSchema, type Account, type Buyer, type Firmographics, type Signal } from "@/lib/schemas";
+import { accountSchema, type Account, type Buyer, type BuyerResearchDiagnostic, type Firmographics, type Signal } from "@/lib/schemas";
 
 export type ZoomInfoCompanyProfile = {
   firmographics: Firmographics;
@@ -15,6 +15,7 @@ export type ZoomInfoAccountUpdate = {
   buyers: Buyer[];
   profile?: ZoomInfoCompanyProfile;
   buyersFailed?: boolean;
+  buyerResearch?: BuyerResearchDiagnostic;
   warnings?: string[];
 };
 
@@ -88,7 +89,7 @@ export function applyZoomInfoUpdatesToAccounts(accounts: Account[], updates: Zoo
       providerIds: { ...account.providerIds, zoominfoCompanyId: update.zoominfoCompanyId },
       signal: { ...update.signal, accountId: account.id },
       buyers: mergeBuyers(account, update.buyers, update.buyersFailed),
-      enrichment: { lastAttemptedAt: new Date().toISOString(), lastSuccessfulAt: update.signal.source.observedAt, warnings: update.warnings || [] },
+      enrichment: { lastAttemptedAt: new Date().toISOString(), lastSuccessfulAt: update.signal.source.observedAt, warnings: update.warnings || [], buyerResearch: update.buyerResearch },
     });
   });
 }

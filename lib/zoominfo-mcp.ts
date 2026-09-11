@@ -9,15 +9,17 @@ import {
   type StoredOAuthClientInformation,
   type StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
-import { accountSchema, buyerSchema, firmographicsSchema, signalSchema, type Account, type Buyer, type Firmographics, type Signal } from "@/lib/schemas";
+import { accountSchema, buyerSchema, firmographicsSchema, signalSchema, type Account, type Buyer, type BuyerResearchDiagnostic, type Firmographics, type Signal } from "@/lib/schemas";
 import { appPersistence, redisConfigured, resetPersistenceForTests, type AppPersistence, type PendingOAuth } from "@/lib/persistence";
 import { scoreAccount } from "@/lib/scoring";
 import { applyAndPersistZoomInfoUpdates, loadAccounts, type ZoomInfoAccountUpdate, type ZoomInfoCompanyProfile } from "@/lib/session-store";
 import { decryptOAuthTokens, encryptOAuthTokens, tokenEncryptionConfigured } from "@/lib/token-crypto";
 
-const REQUIRED_TOOLS = ["lookup", "search_companies", "get_recommended_contacts", "search_contacts"] as const;
+const REQUIRED_TOOLS = ["lookup", "search_companies", "get_recommended_contacts"] as const;
 type SignalToolMode = "unified" | "legacy";
 let signalToolModes = new WeakMap<Client, SignalToolMode>();
+type ContactToolContract = { recommendationSchema?: unknown; resolverName: "enrich_contacts" | "search_contacts"; resolverSchema?: unknown };
+let contactToolContracts = new WeakMap<Client, ContactToolContract>();
 const DEFAULT_TOPIC_QUERIES = ["artificial intelligence", "generative AI", "digital transformation", "cloud migration", "data analytics"];
 const RELEVANT_SCOOP_TYPES = ["Funding", "Mergers & Acquisitions (M&A)", "New Hire", "Promotion", "Management Move", "Executive Move", "Project", "Pain Point", "Partnership", "Product Launch", "Facilities Relocation / Expansion"];
 
@@ -237,6 +239,7 @@ function summarizeToolSchema(tool: { inputSchema?: unknown }): string | undefine
 // server still exposes it. Selection belongs to a connection, never a global user.
 async function discoverRequiredTools(client: Client): Promise<void> {
   signalToolModes.delete(client);
+  contactToolContracts.delete(client);
   const listed: Awaited<ReturnType<Client["listTools"]>>["tools"] = [];
   let cursor: string | undefined;
   const seenCursors = new Set<string>();
@@ -253,9 +256,23 @@ async function discoverRequiredTools(client: Client): Promise<void> {
     : names.includes("enrich_intent") && names.includes("enrich_scoops") ? "legacy" : undefined;
   if (!mode) missing.push("enrich_company_signals (or both legacy enrich_intent and enrich_scoops)");
   lookupSchemaSummary = summarizeToolSchema(listed.find((tool) => tool.name === "lookup") ?? {});
+  let contactContract: ContactToolContract | undefined;
+  const contactSchemaErrors: string[] = [];
+  for (const resolverName of ["enrich_contacts", "search_contacts"] as const) {
+    if (!names.includes(resolverName)) continue;
+    const candidate: ContactToolContract = {
+      recommendationSchema: listed.find((tool) => tool.name === "get_recommended_contacts")?.inputSchema,
+      resolverName,
+      resolverSchema: listed.find((tool) => tool.name === resolverName)?.inputSchema,
+    };
+    try { recommendedContactArgs(candidate, "1"); contactResolverArgs(candidate, "1"); contactContract = candidate; break; }
+    catch (error) { contactSchemaErrors.push(`${resolverName}: ${friendlyError(error)}`); }
+  }
+  if (!contactContract) missing.push(contactSchemaErrors.length ? `supported contact tool schema (${contactSchemaErrors.join("; ")})` : "enrich_contacts (or search_contacts)");
   await appPersistence().updateZoomInfoMeta({ discoveredTools: names, requiredToolsReady: missing.length === 0, ...(missing.length === 0 ? { error: undefined, authorizationPendingUntil: undefined } : {}) });
   if (missing.length) throw new Error(`ZoomInfo connection lacks supported MCP capabilities: ${missing.join(", ")}. Available tools: ${names.join(", ")}.`);
   signalToolModes.set(client, mode!);
+  contactToolContracts.set(client, contactContract!);
 }
 
 export async function beginZoomInfoAuthorization(): Promise<string> {
@@ -498,6 +515,48 @@ function stringValue(record: UnknownRecord, keys: string[]): string | undefined 
     if (typeof value === "number") return String(value);
   }
   return undefined;
+}
+
+function schemaProperties(schema: unknown): UnknownRecord | undefined {
+  return asRecord(asRecord(schema)?.properties);
+}
+
+function schemaKey(schema: unknown, candidates: string[], fallback: string): string {
+  const properties = schemaProperties(schema);
+  if (!properties || !Object.keys(properties).length) return fallback;
+  const key = candidates.find((candidate) => Object.hasOwn(properties, candidate));
+  if (!key) throw new Error(`ZoomInfo tool schema is missing a supported identifier field (${candidates.join(", ")})`);
+  return key;
+}
+
+function schemaSupports(schema: unknown, key: string): boolean {
+  const properties = schemaProperties(schema);
+  return !properties || !Object.keys(properties).length || Object.hasOwn(properties, key);
+}
+
+function schemaValue(schema: unknown, key: string, value: string): string | number | Array<string | number> {
+  const property = asRecord(schemaProperties(schema)?.[key]);
+  const numeric = Number(value);
+  const valueType = property?.type === "array" ? asRecord(property.items)?.type : property?.type;
+  const normalized = valueType === "string" ? String(value) : Number.isSafeInteger(numeric) && numeric > 0 ? numeric : value;
+  return property?.type === "array" ? [normalized] : normalized;
+}
+
+function recommendedContactArgs(contract: ContactToolContract, companyId: string): UnknownRecord {
+  const key = schemaKey(contract.recommendationSchema, ["ziCompanyId", "zoominfoCompanyId", "companyId"], "ziCompanyId");
+  const args: UnknownRecord = { [key]: schemaValue(contract.recommendationSchema, key, companyId) };
+  if (schemaSupports(contract.recommendationSchema, "useCaseType")) args.useCaseType = "PROSPECTING";
+  if (schemaSupports(contract.recommendationSchema, "pageSize")) args.pageSize = 3;
+  return args;
+}
+
+function contactResolverArgs(contract: ContactToolContract, personId: string): UnknownRecord {
+  const candidates = ["personId", "zoominfoContactId", "contactId", "personIds", "zoominfoContactIds", "contactIds"];
+  const key = schemaKey(contract.resolverSchema, candidates, "personId");
+  const args: UnknownRecord = { [key]: schemaValue(contract.resolverSchema, key, personId) };
+  if (schemaSupports(contract.resolverSchema, "pageSize")) args.pageSize = 1;
+  if (schemaSupports(contract.resolverSchema, "userIntent")) args.userIntent = "Resolve a recommended business contact's name and title only; do not return engagement details.";
+  return args;
 }
 
 // Number(null), Number("") and Number([]) are all 0, so coercing blindly turns a field
@@ -797,20 +856,89 @@ export function normalizeBuyerFromContact(record: UnknownRecord, personId: strin
   });
 }
 
-async function fetchBuyers(client: Client, companyId: string): Promise<Buyer[]> {
-  const recommendationsPayload = await callTool(client, "get_recommended_contacts", { ziCompanyId: Number(companyId), useCaseType: "PROSPECTING", pageSize: 3 });
-  const recommendations = findRecords(recommendationsPayload, ["recommendations", "results", "data", "records"]).slice(0, 3);
+type BuyerLookupResult = { buyers: Buyer[]; diagnostic: BuyerResearchDiagnostic; preserveExisting: boolean };
+
+function contactIdentityRecord(record: UnknownRecord): UnknownRecord {
+  for (const key of ["contact", "person", "recommendedContact", "profile"]) {
+    const nested = flattenRecord(record[key]);
+    if (nested) return { ...record, ...nested };
+  }
+  return record;
+}
+
+function explicitContactCollection(value: unknown, preferredKeys: string[]): UnknownRecord[] | undefined {
+  if (Array.isArray(value)) return value.map(flattenRecord).filter((item): item is UnknownRecord => Boolean(item));
+  const record = asRecord(value);
+  if (!record) return undefined;
+  for (const key of preferredKeys) {
+    if (!Object.hasOwn(record, key)) continue;
+    const found = explicitContactCollection(record[key], preferredKeys);
+    if (found !== undefined) return found;
+  }
+  for (const nested of Object.values(record)) {
+    if (!nested || typeof nested !== "object") continue;
+    const found = explicitContactCollection(nested, preferredKeys);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function contactRecords(payload: unknown, preferredKeys: string[]): UnknownRecord[] {
+  return (explicitContactCollection(payload, preferredKeys) ?? findRecords(payload, preferredKeys)).map(contactIdentityRecord);
+}
+
+function failedBuyerLookup(message = "ZoomInfo buyer research failed before contacts could be verified."): BuyerLookupResult {
+  return {
+    buyers: [],
+    preserveExisting: true,
+    diagnostic: { status: "failed", recommendationsReturned: 0, usableContactIds: 0, contactsHydrated: 0, contactsRejected: 0, message },
+  };
+}
+
+function buyerResearchDiagnostic(recommendationsReturned: number, usableContactIds: number, contactsHydrated: number, resolverFailures: number): BuyerResearchDiagnostic {
+  const contactsRejected = Math.max(0, recommendationsReturned - contactsHydrated);
+  if (!recommendationsReturned) return { status: "empty", recommendationsReturned, usableContactIds, contactsHydrated, contactsRejected, message: "ZoomInfo returned no recommended contacts for this account." };
+  if (contactsHydrated === recommendationsReturned) return { status: "verified", recommendationsReturned, usableContactIds, contactsHydrated, contactsRejected, message: `ZoomInfo verified ${contactsHydrated} recommended buyer contact${contactsHydrated === 1 ? "" : "s"}.` };
+  if (contactsHydrated) return { status: "partial", recommendationsReturned, usableContactIds, contactsHydrated, contactsRejected, message: `ZoomInfo verified ${contactsHydrated} of ${recommendationsReturned} recommended buyer contacts; ${contactsRejected} could not be resolved.` };
+  if (resolverFailures) return { status: "failed", recommendationsReturned, usableContactIds, contactsHydrated, contactsRejected, message: "ZoomInfo returned recommendations, but contact resolution failed. Retry this account." };
+  return { status: "partial", recommendationsReturned, usableContactIds, contactsHydrated, contactsRejected, message: "ZoomInfo returned recommendations, but none included enough verified identity information to use." };
+}
+
+async function fetchBuyers(client: Client, companyId: string): Promise<BuyerLookupResult> {
+  const contract = contactToolContracts.get(client) ?? { resolverName: "search_contacts" as const };
+  let recommendationsPayload: unknown;
+  try {
+    recommendationsPayload = await callTool(client, "get_recommended_contacts", recommendedContactArgs(contract, companyId));
+  } catch {
+    return failedBuyerLookup("ZoomInfo's recommended-contact lookup failed. Retry this account.");
+  }
+  const recommendations = contactRecords(recommendationsPayload, ["recommendations", "recommendedContacts", "results", "data", "records", "contacts"]).slice(0, 3);
   const buyers: Buyer[] = [];
+  const usableIds = new Set<string>();
+  let resolverFailures = 0;
   for (let index = 0; index < recommendations.length; index += 1) {
     const personId = stringValue(recommendations[index], ["zoominfoContactId", "personId", "contactId", "id"]);
-    if (!personId) continue;
-    const contactPayload = await callTool(client, "search_contacts", { personId, pageSize: 1, userIntent: "Resolve a recommended business contact's name and title only; do not return engagement details." });
-    const contact = findRecords(contactPayload, ["contacts", "results", "data", "records"])[0];
+    if (!personId || usableIds.has(personId)) continue;
+    usableIds.add(personId);
+    const direct = normalizeBuyerFromContact(recommendations[index], personId, index + 1);
+    if (direct) { buyers.push(direct); continue; }
+    let contactPayload: unknown;
+    try {
+      contactPayload = await callTool(client, contract.resolverName, contactResolverArgs(contract, personId));
+    } catch {
+      resolverFailures += 1;
+      continue;
+    }
+    const candidates = contactRecords(contactPayload, ["contacts", "people", "person", "contact", "results", "data", "records"]);
+    const complete = (record: UnknownRecord) => Boolean(stringValue(record, ["fullName", "name", "firstName"]) && stringValue(record, ["jobTitle", "title"]));
+    const contact = candidates.find((record) => stringValue(record, ["zoominfoContactId", "personId", "contactId", "id"]) === personId && complete(record))
+      ?? (candidates.length === 1 && complete(candidates[0]) ? candidates[0] : undefined);
     if (!contact) continue;
     const buyer = normalizeBuyerFromContact(contact, personId, index + 1);
     if (buyer) buyers.push(buyer);
   }
-  return buyers;
+  const diagnostic = buyerResearchDiagnostic(recommendations.length, usableIds.size, buyers.length, resolverFailures);
+  return { buyers, diagnostic, preserveExisting: diagnostic.status === "failed" || diagnostic.status === "partial" && buyers.length === 0 };
 }
 
 function isoDateDaysAgo(days: number): string {
@@ -893,8 +1021,8 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
     ]);
     if (signals.status === "rejected") throw signals.reason;
     const normalized = buildSignalFromCompanySignals(account.id, company.companyId, signals.value, topics);
-    if (buyers.status === "rejected") normalized.warnings.push("Contact lookup failed; any previously observed contacts need rechecking.");
-    return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, ...normalized, buyers: buyers.status === "fulfilled" ? buyers.value : [], buyersFailed: buyers.status === "rejected", profile: buildCompanyProfile(company.record) };
+    const buyerLookup = buyers.status === "fulfilled" ? buyers.value : failedBuyerLookup();
+    return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, ...normalized, buyers: buyerLookup.buyers, buyersFailed: buyerLookup.preserveExisting, buyerResearch: buyerLookup.diagnostic, profile: buildCompanyProfile(company.record) };
   }
   const lookbackDays = Number(process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90);
   const startDate = isoDateDaysAgo(lookbackDays);
@@ -912,7 +1040,7 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
   if ((intentResult.status === "rejected" || !topics.length) && scoopsResult.status === "rejected") throw scoopsResult.reason;
   const intentPayload = intentResult.status === "fulfilled" ? intentResult.value : {};
   const scoopsPayload = scoopsResult.status === "fulfilled" ? scoopsResult.value : {};
-  const buyers = buyersResult.status === "fulfilled" ? buyersResult.value : [];
+  const buyerLookup = buyersResult.status === "fulfilled" ? buyersResult.value : failedBuyerLookup();
   const signal = buildSignalFromToolResults(account.id, intentPayload, scoopsPayload);
   const warnings: string[] = [];
   if (!topics.length || intentResult.status === "rejected") {
@@ -929,8 +1057,7 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
     signal.whyNow = "Retry the missing sources before concluding that there is no current trigger.";
     signal.activeWithin90Days = null;
   }
-  if (buyersResult.status === "rejected") warnings.push("Contact lookup failed; any previously observed contacts need rechecking.");
-  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal, buyers, profile: buildCompanyProfile(company.record), buyersFailed: buyersResult.status === "rejected", warnings };
+  return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal, buyers: buyerLookup.buyers, profile: buildCompanyProfile(company.record), buyersFailed: buyerLookup.preserveExisting, buyerResearch: buyerLookup.diagnostic, warnings };
 }
 
 export function refreshCandidates(items: Account[], accountId?: string, accountIds?: string[]): Account[] {
@@ -960,7 +1087,7 @@ export function refreshCandidates(items: Account[], accountId?: string, accountI
 // Bump when a refresh starts capturing fields the cached payload does not carry, otherwise a
 // warm cache keeps serving the older, thinner shape until its TTL expires and the new data
 // never reaches the workspace. v2 added company firmographics and full signal evidence.
-const CACHE_SHAPE_VERSION = "v4";
+const CACHE_SHAPE_VERSION = "v5";
 
 function cacheKey(account: Account, topics: string[]): string {
   return `${CACHE_SHAPE_VERSION}|${account.canonicalCompanyId}|${normalizeDomain(account.website)}|${topics.join("|")}|${process.env.ZOOMINFO_SIGNAL_LOOKBACK_DAYS || 90}`;
@@ -1069,6 +1196,7 @@ export function resetZoomInfoStateForTests(): void {
   resetPersistenceForTests();
   toolQueue = Promise.resolve();
   signalToolModes = new WeakMap();
+  contactToolContracts = new WeakMap();
 }
 
-export const zoomInfoInternalsForTests = { discoverRequiredTools, refreshOneAccount, callTool, isRateLimited, extractToolPayload, findRecords };
+export const zoomInfoInternalsForTests = { discoverRequiredTools, refreshOneAccount, fetchBuyers, callTool, isRateLimited, extractToolPayload, findRecords };

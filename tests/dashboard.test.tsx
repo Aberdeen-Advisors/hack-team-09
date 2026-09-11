@@ -66,6 +66,23 @@ describe("workspace navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open ZoomInfo setup" }));
     expect(screen.getByRole("button", { name: "Connect ZoomInfo" })).toBeEnabled();
   });
+
+  it("shows persisted buyer research counts in Prioritize and the exact empty result in Pursuit", () => {
+    const account = liveAccount();
+    account.buyers = [];
+    account.enrichment = {
+      lastAttemptedAt: "2026-09-10T12:00:00Z",
+      lastSuccessfulAt: "2026-09-10T12:00:00Z",
+      warnings: [],
+      buyerResearch: { status: "empty", recommendationsReturned: 0, usableContactIds: 0, contactsHydrated: 0, contactsRejected: 0, message: "ZoomInfo returned no recommended contacts for this account." },
+    };
+    render(<Dashboard initialDetails={listAccountDetails([account])} initialStatus={status} metrics={{ rows: 1, canonicalAccounts: 1, pursueNow: 0 }} initialStage="prioritize" />);
+    expect(screen.getByText("Buyer research:")).toBeInTheDocument();
+    expect(screen.getByText(/Recommendations 0 · usable IDs 0 · contacts hydrated 0 · rejected 0/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /Pursuit/ }));
+    expect(screen.getByText("ZoomInfo returned no recommended contacts for this account.")).toBeInTheDocument();
+    expect(screen.queryByText("No verified buyer is available. Refresh contacts or complete buyer research before choosing a recipient.")).not.toBeInTheDocument();
+  });
 });
 
 
