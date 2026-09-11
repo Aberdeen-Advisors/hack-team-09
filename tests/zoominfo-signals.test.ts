@@ -114,7 +114,7 @@ describe("buyer contact resolution", () => {
     expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_contacts", arguments: { personIds: [22] } }, expect.anything());
   });
 
-  it("preserves the current recommendation ID beside attributes and requests only safe identity fields", async () => {
+  it("preserves the current recommendation ID and requests available business contact fields", async () => {
     const currentEnrichSchema = {
       contacts: { type: "array", items: { type: "object" } },
       requiredFields: { type: "array", items: { type: "string" } },
@@ -124,14 +124,14 @@ describe("buyer contact resolution", () => {
       listTools: vi.fn().mockResolvedValue({ tools: contactTools("enrich_contacts", currentEnrichSchema) }),
       callTool: vi.fn(async ({ name }: { name: string }) => name === "get_recommended_contacts"
         ? { structuredContent: { recommendations: [{ zoominfoContactId: 13728122400, attributes: { rank: 1, score: 0.84, recommendedPersonBrief: "Director, Data" } }] } }
-        : { structuredContent: { data: [{ status: "success", data: { person: { personId: "13728122400", firstName: "Casey", lastName: "Example", jobTitle: "Director, Data" } } }] } }),
+        : { structuredContent: { data: [{ status: "success", data: { person: { personId: "13728122400", firstName: "Casey", lastName: "Example", jobTitle: "Director, Data", email: "casey@example.com", phone: "+1 555-0134", externalUrls: [{ url: "https://www.linkedin.com/in/casey-example" }] } } }] } }),
     };
     await zoomInfoInternalsForTests.discoverRequiredTools(client as never);
     const result = await zoomInfoInternalsForTests.fetchBuyers(client as never, "123");
-    expect(result.buyers[0]).toMatchObject({ name: "Casey Example", title: "Director, Data" });
+    expect(result.buyers[0]).toMatchObject({ name: "Casey Example", title: "Director, Data", email: "casey@example.com", phone: "+1 555-0134", linkedinUrl: "https://www.linkedin.com/in/casey-example" });
     expect(client.callTool).toHaveBeenCalledWith({ name: "enrich_contacts", arguments: {
       contacts: [{ personId: "13728122400" }],
-      requiredFields: ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId"],
+      requiredFields: ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId", "email", "phone", "mobilePhone", "externalUrls"],
       userIntent: expect.any(String),
     } }, expect.anything());
   });

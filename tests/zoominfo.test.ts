@@ -59,12 +59,17 @@ describe("ZoomInfo MCP normalization", () => {
     expect(signal.source.provenance).toBe("verified");
   });
 
-  it("keeps buyer identity fields while excluding email and phone data", () => {
-    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", email: "jordan@example.com", phone: "555-0100" }, "123", 1, new Date("2026-08-13T12:00:00.000Z"));
+  it("keeps verified business contact details and normalizes LinkedIn URLs", () => {
+    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", email: "jordan@example.com", phone: "+1 555-0100", externalUrls: [{ type: "LinkedIn", url: "linkedin.com/in/jordan-example" }] }, "123", 1, new Date("2026-08-13T12:00:00.000Z"));
 
-    expect(buyer).toMatchObject({ name: "Jordan Example", title: "VP, Data", warmth: "Unknown", decisionRoleProvenance: "inferred", relationshipProvenance: "unknown" });
+    expect(buyer).toMatchObject({ name: "Jordan Example", title: "VP, Data", email: "jordan@example.com", phone: "+1 555-0100", linkedinUrl: "https://linkedin.com/in/jordan-example", warmth: "Unknown", decisionRoleProvenance: "inferred", relationshipProvenance: "unknown" });
+  });
+
+  it("drops malformed contact details instead of failing buyer normalization", () => {
+    const buyer = normalizeBuyerFromContact({ fullName: "Jordan Example", jobTitle: "VP, Data", email: "not-an-email", phone: "unknown", externalUrls: ["javascript:alert(1)"] }, "123", 1);
     expect(buyer).not.toHaveProperty("email");
     expect(buyer).not.toHaveProperty("phone");
+    expect(buyer).not.toHaveProperty("linkedinUrl");
   });
 
   it("keeps every qualifying trigger as evidence, not just the headline", () => {

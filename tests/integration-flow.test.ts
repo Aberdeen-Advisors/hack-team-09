@@ -69,6 +69,13 @@ describe("evidence boundaries", () => {
     expect(groundedAccount(account).revenueMillions).toBeNull();
     expect(scoreAccount(account).components.find((item) => item.key === "revenue")?.earned).toBe(0);
   });
+  it("keeps contact details in the UI account but excludes them from model input", () => {
+    const account = liveAccount();
+    account.buyers[0] = { ...account.buyers[0], email: "jordan@example.com", phone: "+1 555-0100", linkedinUrl: "https://www.linkedin.com/in/jordan-example" };
+    expect(account.buyers[0]).toMatchObject({ email: "jordan@example.com", phone: "+1 555-0100" });
+    expect(groundedAccount(account).buyers[0]).not.toMatchObject({ email: expect.anything(), phone: expect.anything(), linkedinUrl: expect.anything() });
+    expect(evidenceKey(account)).not.toMatch(/jordan@example\.com|555-0100|linkedin\.com/);
+  });
 });
 
 describe("grounded recommendations and outreach", () => {

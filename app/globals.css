@@ -120,6 +120,9 @@ button:focus-visible,a:focus-visible,select:focus-visible,textarea:focus-visible
 .buyer-card-top { display:flex; justify-content:space-between; gap:10px; }
 .buyer-card h4 { margin:0; color:var(--aberdeen-blue); font-size:13px; }
 .buyer-card p { font-size:10px; margin-top:5px; }
+.buyer-contact-actions { display:flex; align-items:center; gap:6px; margin-top:9px; }
+.contact-action { width:29px; height:29px; padding:0; border:1px solid #cbd9df; border-radius:50%; background:#f7fafb; color:var(--aberdeen-blue); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; text-decoration:none; }
+.contact-action:hover { background:#e7f4f4; border-color:var(--aberdeen-teal); }
 .buyer-path { margin-top:10px; padding-top:9px; border-top:1px solid #e7edf0; color:var(--onyx); font-size:10px; }
 .offering-hero { padding:18px; color:white; background:var(--aberdeen-blue); border-radius:5px; margin-bottom:14px; }
 .offering-hero .eyebrow { color:var(--aberdeen-teal); }

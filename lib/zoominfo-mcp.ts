@@ -553,17 +553,15 @@ function contactResolverArgs(contract: ContactToolContract, personId: string): U
   const properties = schemaProperties(contract.resolverSchema);
   if (properties && Object.hasOwn(properties, "contacts")) {
     const args: UnknownRecord = { contacts: [{ personId }] };
-    // ZoomInfo defaults to returning email when requiredFields is omitted. Request
-    // only the professional identity fields needed for a selectable recipient.
-    if (Object.hasOwn(properties, "requiredFields")) args.requiredFields = ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId"];
-    if (Object.hasOwn(properties, "userIntent")) args.userIntent = "Resolve a recommended business contact's name and title only; do not return email or phone data.";
+    if (Object.hasOwn(properties, "requiredFields")) args.requiredFields = ["firstName", "lastName", "jobTitle", "jobFunction", "managementLevel", "zoominfoCompanyId", "email", "phone", "mobilePhone", "externalUrls"];
+    if (Object.hasOwn(properties, "userIntent")) args.userIntent = "Resolve a recommended business contact's professional identity, business email, business phone, and LinkedIn profile when available.";
     return args;
   }
   const candidates = ["personId", "zoominfoContactId", "contactId", "personIds", "zoominfoContactIds", "contactIds"];
   const key = schemaKey(contract.resolverSchema, candidates, "personId");
   const args: UnknownRecord = { [key]: schemaValue(contract.resolverSchema, key, personId) };
   if (schemaSupports(contract.resolverSchema, "pageSize")) args.pageSize = 1;
-  if (schemaSupports(contract.resolverSchema, "userIntent")) args.userIntent = "Resolve a recommended business contact's name and title only; do not return engagement details.";
+  if (schemaSupports(contract.resolverSchema, "userIntent")) args.userIntent = "Resolve a recommended business contact's professional identity and available business contact details.";
   return args;
 }
 
@@ -878,17 +876,86 @@ function decisionRoleForTitle(title: string): string {
   return "Potential practitioner or subject-matter influencer";
 }
 
+function nestedStringValue(value: unknown, keys: string[], depth = 0): string | undefined {
+  if (depth > 5) return undefined;
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = nestedStringValue(item, keys, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const direct = stringValue(record, keys);
+  if (direct) return direct;
+  for (const nested of Object.values(record)) {
+    if (!nested || typeof nested !== "object") continue;
+    const found = nestedStringValue(nested, keys, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function contactDetail(record: UnknownRecord, fields: string[], nestedKeys: string[]): string | undefined {
+  const direct = stringValue(record, fields);
+  if (direct) return direct;
+  for (const field of fields) {
+    const found = nestedStringValue(record[field], nestedKeys);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function normalizedEmail(record: UnknownRecord): string | undefined {
+  const email = contactDetail(record, ["email", "emailAddress", "businessEmail"], ["email", "emailAddress", "address", "value"]);
+  return email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : undefined;
+}
+
+function normalizedPhone(record: UnknownRecord): string | undefined {
+  const phone = contactDetail(record, ["phone", "directPhone", "mobilePhone", "businessPhone"], ["phone", "number", "value"]);
+  return phone && /\d/.test(phone) && phone.length <= 50 ? phone : undefined;
+}
+
+function collectStrings(value: unknown, depth = 0): string[] {
+  if (depth > 5) return [];
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (Array.isArray(value)) return value.flatMap((item) => collectStrings(item, depth + 1));
+  const record = asRecord(value);
+  return record ? Object.values(record).flatMap((nested) => collectStrings(nested, depth + 1)) : [];
+}
+
+function normalizedLinkedInUrl(record: UnknownRecord): string | undefined {
+  const direct = ["linkedinUrl", "linkedInUrl", "linkedinProfileUrl", "linkedin", "externalURL"]
+    .flatMap((key) => collectStrings(record[key]));
+  const external = collectStrings(record.externalUrls ?? record.externalURLs);
+  for (const candidate of [...direct, ...external]) {
+    if (!/linkedin\.com/i.test(candidate)) continue;
+    try {
+      const url = new URL(/^https?:\/\//i.test(candidate) ? candidate : `https://${candidate.replace(/^\/+/, "")}`);
+      const hostname = url.hostname.toLowerCase();
+      if (hostname === "linkedin.com" || hostname.endsWith(".linkedin.com")) return url.toString();
+    } catch { /* Ignore malformed provider URLs. */ }
+  }
+  return undefined;
+}
+
 export function normalizeBuyerFromContact(record: UnknownRecord, personId: string, rank: number, now = new Date()): Buyer | undefined {
   const name = stringValue(record, ["fullName", "name"]) || [stringValue(record, ["firstName"]), stringValue(record, ["lastName"])].filter(Boolean).join(" ");
   const title = stringValue(record, ["jobTitle", "title"]);
   if (!name || !title) return undefined;
-  // Function, seniority, and department are the only non-identifying context ZoomInfo
-  // returns that changes how a buyer is approached; email and phone stay excluded.
+  const email = normalizedEmail(record);
+  const phone = normalizedPhone(record);
+  const linkedinUrl = normalizedLinkedInUrl(record);
   const context = [stringValue(record, ["managementLevel", "seniority"]), stringValue(record, ["jobFunction", "department"]), stringValue(record, ["city", "location"])].filter(Boolean).join(" · ");
   return buyerSchema.parse({
     id: `zoominfo-person-${personId}`,
     name,
     title,
+    ...(email ? { email } : {}),
+    ...(phone ? { phone } : {}),
+    ...(linkedinUrl ? { linkedinUrl } : {}),
     decisionRole: decisionRoleForTitle(title),
     decisionRoleProvenance: "inferred",
     warmth: "Unknown",

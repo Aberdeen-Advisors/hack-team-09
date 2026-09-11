@@ -9,7 +9,20 @@ export function hasCurrentSignal(account: Account): boolean {
 }
 
 export function evidenceKey(account: Account): string {
-  return JSON.stringify([account.signal, account.buyers, account.firmographics, account.revenueMillions, account.industry, account.enrichment?.warnings || []]);
+  return JSON.stringify([account.signal, account.buyers.map(withoutContactDetails), account.firmographics, account.revenueMillions, account.industry, account.enrichment?.warnings || []]);
+}
+
+function withoutContactDetails(buyer: Buyer): Buyer {
+  const sanitized = { ...buyer };
+  delete sanitized.email;
+  delete sanitized.phone;
+  delete sanitized.linkedinUrl;
+  return sanitized;
+}
+
+function buyerForModel(buyer: Buyer): Buyer {
+  const sanitized = withoutContactDetails(buyer);
+  return buyer.relationshipProvenance === "verified" ? sanitized : { ...sanitized, warmth: "Unknown", relationshipSource: "No verified Aberdeen relationship", relationshipProvenance: "unknown", suggestedPath: "Validate relevance before outreach." };
 }
 
 // Only grounded fields reach the model; seeded warmth and company facts are excluded.
@@ -20,6 +33,6 @@ export function groundedAccount(account: Account): Account {
     revenueMillions: revenueSource.provenance === "verified" ? (account.firmographics ? account.firmographics.revenueMillions ?? null : account.revenueMillions) : null,
     revenueRange: revenueSource.provenance === "verified" ? account.revenueRange : "Not verified",
     industry: account.firmographics?.industry || (account.source.provenance === "verified" ? account.industry : "Not verified"),
-    buyers: account.buyers.filter((buyer) => buyer.source.provenance === "verified").map((buyer) => buyer.relationshipProvenance === "verified" ? buyer : { ...buyer, warmth: "Unknown", relationshipSource: "No verified Aberdeen relationship", relationshipProvenance: "unknown", suggestedPath: "Validate relevance before outreach." }),
+    buyers: account.buyers.filter((buyer) => buyer.source.provenance === "verified").map(buyerForModel),
   };
 }

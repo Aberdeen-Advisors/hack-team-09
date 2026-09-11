@@ -60,6 +60,12 @@ export const buyerSchema = z.object({
   id: z.string(),
   name: z.string(),
   title: z.string(),
+  email: z.string().email().optional(),
+  phone: z.string().min(5).max(50).optional(),
+  linkedinUrl: z.string().url().refine((value) => {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "linkedin.com" || hostname.endsWith(".linkedin.com");
+  }, "LinkedIn URL must use linkedin.com").optional(),
   decisionRole: z.string(),
   decisionRoleProvenance: provenanceSchema.optional(),
   warmth: relationshipWarmthSchema,

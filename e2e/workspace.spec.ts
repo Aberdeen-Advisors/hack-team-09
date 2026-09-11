@@ -23,6 +23,9 @@ test("laptop journey carries ZoomInfo evidence through all three stages", async 
   await expect(page.getByRole("status")).toContainText("Finished:");
   await page.getByRole("button", { name: /Map buyer and offering/ }).click();
   await expect(page.getByRole("tab", { name: /Pursuit/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("button", { name: "Copy email for Jordan Example" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy phone for Jordan Example" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Open LinkedIn profile for Jordan Example" })).toHaveAttribute("href", "https://www.linkedin.com/in/jordan-example");
   await page.getByRole("button", { name: /Draft outreach/ }).click();
   await expect(page.getByRole("tab", { name: /Outreach/ })).toHaveAttribute("aria-selected", "true");
 

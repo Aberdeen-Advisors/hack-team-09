@@ -83,6 +83,21 @@ describe("workspace navigation", () => {
     expect(screen.getByText("ZoomInfo returned no recommended contacts for this account.")).toBeInTheDocument();
     expect(screen.queryByText("No verified buyer is available. Refresh contacts or complete buyer research before choosing a recipient.")).not.toBeInTheDocument();
   });
+
+  it("offers accessible contact actions and copies buyer details", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const account = liveAccount();
+    account.buyers[0] = { ...account.buyers[0], email: "jordan@example.com", phone: "+1 555-0100", linkedinUrl: "https://www.linkedin.com/in/jordan-example" };
+    render(<Dashboard initialDetails={listAccountDetails([account])} initialStatus={status} metrics={{ rows: 1, canonicalAccounts: 1, pursueNow: 1 }} initialStage="pursuit" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy email for Jordan Example" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("jordan@example.com"));
+    expect(screen.getByRole("status")).toHaveTextContent("Email copied.");
+    fireEvent.click(screen.getByRole("button", { name: "Copy phone for Jordan Example" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("+1 555-0100"));
+    expect(screen.getByRole("link", { name: "Open LinkedIn profile for Jordan Example" })).toHaveAttribute("href", "https://www.linkedin.com/in/jordan-example");
+  });
 });
 
 
