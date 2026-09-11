@@ -1,6 +1,6 @@
 import { Redis } from "@upstash/redis";
 import type { OAuthDiscoveryState, StoredOAuthTokens } from "@modelcontextprotocol/client";
-import type { Account } from "@/lib/schemas";
+import type { Account, TargetList } from "@/lib/schemas";
 import type { ZoomInfoAccountUpdate } from "@/lib/session-store";
 
 export type PendingOAuth = {
@@ -33,6 +33,8 @@ export interface AppPersistence {
   readonly kind: "memory" | "redis";
   loadAccounts(): Promise<Account[] | null>;
   saveAccounts(accounts: Account[]): Promise<void>;
+  loadTargetLists(): Promise<TargetList[] | null>;
+  saveWorkspace(accounts: Account[], lists: TargetList[]): Promise<void>;
   createPendingOAuth(record: PendingOAuth, ttlSeconds: number): Promise<void>;
   updatePendingOAuth(state: string, patch: Partial<PendingOAuth>, ttlSeconds: number): Promise<void>;
   getPendingOAuth(state: string): Promise<PendingOAuth | null>;
@@ -53,6 +55,7 @@ const DEFAULT_META: ZoomInfoMeta = { requiredToolsReady: false, discoveredTools:
 
 type MemoryState = {
   accounts: Account[] | null;
+  lists: TargetList[] | null;
   pending: Map<string, { value: PendingOAuth; expiresAt: number }>;
   tokenBlob: string | null;
   meta: ZoomInfoMeta;
@@ -68,6 +71,7 @@ function memoryState(): MemoryState {
   if (!globalThis.__signalOutreachPersistence) {
     globalThis.__signalOutreachPersistence = {
       accounts: null,
+      lists: null,
       pending: new Map(),
       tokenBlob: null,
       meta: { ...DEFAULT_META },
@@ -83,6 +87,12 @@ class MemoryPersistence implements AppPersistence {
 
   async loadAccounts() { return memoryState().accounts ? structuredClone(memoryState().accounts) : null; }
   async saveAccounts(accounts: Account[]) { memoryState().accounts = structuredClone(accounts); }
+  async loadTargetLists() { return memoryState().lists ? structuredClone(memoryState().lists) : null; }
+  async saveWorkspace(accounts: Account[], lists: TargetList[]) {
+    const snapshot = structuredClone({ accounts, lists });
+    memoryState().accounts = snapshot.accounts;
+    memoryState().lists = snapshot.lists;
+  }
   async createPendingOAuth(record: PendingOAuth, ttlSeconds: number) { memoryState().pending.set(record.state, { value: structuredClone(record), expiresAt: Date.now() + ttlSeconds * 1000 }); }
   async updatePendingOAuth(state: string, patch: Partial<PendingOAuth>, ttlSeconds: number) {
     const current = await this.getPendingOAuth(state);
@@ -124,6 +134,10 @@ class RedisPersistence implements AppPersistence {
   private cacheKey(id: string) { return this.key(`zoominfo:cache:${id}`); }
   async loadAccounts() { return this.redis.get<Account[]>(this.key("accounts")); }
   async saveAccounts(accounts: Account[]) { await this.redis.set(this.key("accounts"), accounts); }
+  async loadTargetLists() { return this.redis.get<TargetList[]>(this.key("target-lists")); }
+  async saveWorkspace(accounts: Account[], lists: TargetList[]) {
+    await this.redis.multi().set(this.key("accounts"), accounts).set(this.key("target-lists"), lists).exec();
+  }
   async createPendingOAuth(record: PendingOAuth, ttlSeconds: number) { await this.redis.set(this.pendingKey(record.state), record, { ex: ttlSeconds }); }
   async updatePendingOAuth(state: string, patch: Partial<PendingOAuth>, ttlSeconds: number) {
     const current = await this.getPendingOAuth(state);

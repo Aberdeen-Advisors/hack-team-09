@@ -18,12 +18,16 @@
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "@upstash/redis": "^1.38.2",
+    "exceljs": "^4.4.0",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "latest",
     "react": "latest",
     "react-dom": "latest",
     "zod": "latest"
+  },
+  "overrides": {
+    "exceljs": { "uuid": "^11.1.1" }
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",

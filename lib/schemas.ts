@@ -108,6 +108,30 @@ export const accountSchema = z.object({
 });
 export type Account = z.infer<typeof accountSchema>;
 
+export const targetListMembershipSchema = z.object({
+  accountId: z.string(),
+  accountName: z.string(),
+  vertical: z.string().optional(),
+  tier: z.number().int().positive().optional(),
+  relationshipStatus: z.string().optional(),
+  suggestedEntryOffer: z.string().optional(),
+  filename: z.string(),
+  importedAt: z.string(),
+});
+export type TargetListMembership = z.infer<typeof targetListMembershipSchema>;
+export const targetListSchema = z.object({
+  id: z.string(),
+  name: z.string().trim().min(1).max(100),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  revision: z.number().int().positive(),
+  memberships: z.array(targetListMembershipSchema),
+});
+export type TargetList = z.infer<typeof targetListSchema>;
+export type TargetListSummary = Omit<TargetList, "memberships"> & {
+  total: number; verified: number; pending: number; failed: number;
+};
+
 export const fourECategorySchema = z.enum([
   "Enterprise Endgame",
   "Execute with Confidence",

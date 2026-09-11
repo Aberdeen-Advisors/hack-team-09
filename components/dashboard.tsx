@@ -2,16 +2,18 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
+import Link from "next/link";
+import { ListEnrichment, type WorkspaceUpdate } from "@/components/list-enrichment";
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, ChevronRight, Clipboard, ExternalLink, LoaderCircle, RefreshCw, Settings2, Signal as SignalIcon, Sparkles, Users, X } from "lucide-react";
 import { evidenceKey, hasCurrentSignal, verifiedWarmBuyer } from "@/lib/evidence";
-import type { Account, AccountDetail, IntegrationStatus, OutreachDraft, WorkspaceStage } from "@/lib/schemas";
+import type { Account, AccountDetail, IntegrationStatus, OutreachDraft, WorkspaceStage, TargetList } from "@/lib/schemas";
 
-type DashboardProps = { initialDetails: AccountDetail[]; initialStatus: IntegrationStatus; metrics: { rows: number; canonicalAccounts: number; pursueNow: number }; initialAccountId?: string; initialStage: WorkspaceStage };
+type DashboardProps = { initialDetails: AccountDetail[]; initialStatus: IntegrationStatus; metrics: { rows: number; canonicalAccounts: number; pursueNow: number }; initialAccountId?: string; initialStage: WorkspaceStage; targetList?: TargetList };
 const stages: { id: WorkspaceStage; label: string }[] = [{ id: "prioritize", label: "Prioritize" }, { id: "pursuit", label: "Pursuit" }, { id: "outreach", label: "Outreach" }];
 const provenanceBadge = (value: string) => <span className={`badge ${value === "demo" ? "demo" : ""}`}>{value === "demo" ? "Demo data" : value}</span>;
 const warmthClass = (warmth: string) => warmth === "Warm" ? "warm" : warmth === "Indirect" ? "indirect" : "";
 
-export function Dashboard({ initialDetails, initialStatus, metrics, initialAccountId, initialStage }: DashboardProps) {
+export function Dashboard({ initialDetails, initialStatus, metrics, initialAccountId, initialStage, targetList }: DashboardProps) {
   const [details, setDetails] = useState(initialDetails);
   const [workspaceMetrics, setWorkspaceMetrics] = useState(metrics);
   const [selectedId, setSelectedId] = useState(initialAccountId ?? initialDetails[0]?.account.id ?? "");
@@ -21,6 +23,9 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const [industry, setIndustry] = useState("all");
   const [signalType, setSignalType] = useState("all");
   const [warmOnly, setWarmOnly] = useState(false);
+  const [targetTier, setTargetTier] = useState("all");
+  const [targetVertical, setTargetVertical] = useState("all");
+  const [targetRelationship, setTargetRelationship] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState(initialStatus);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -34,6 +39,15 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const editedAccounts = useRef(new Set<string>());
   const [connecting, setConnecting] = useState(false);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const membershipById = useMemo(() => new Map(targetList?.memberships.map((member) => [member.accountId, member])), [targetList]);
+  useEffect(() => {
+    if (!targetList) return;
+    let active = true;
+    void fetch("/api/integrations/status", { cache: "no-store" }).then(async (response) => {
+      if (response.ok && active) setStatus(await response.json());
+    }).catch(() => { /* Keep server-rendered diagnostics when the status request fails. */ });
+    return () => { active = false; };
+  }, [targetList]);
 
   const selected = details.find((item) => item.account.id === selectedId) ?? details[0];
   const activeDraft = selected ? drafts[selected.account.id] ?? selected.outreach : undefined;
@@ -60,16 +74,25 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   const industries = useMemo(() => Array.from(new Set(details.map((item) => item.account.industry))).sort(), [details]);
   const signalTypes = useMemo(() => Array.from(new Set(details.map((item) => item.account.signal.type))).sort(), [details]);
   const filtered = useMemo(() => {
-    const list = details.filter((item) => (industry === "all" || item.account.industry === industry) && (signalType === "all" || item.account.signal.type === signalType) && (!warmOnly || Boolean(verifiedWarmBuyer(item.account.buyers))));
+    const list = details.filter((item) => {
+      const context = membershipById.get(item.account.id);
+      return (industry === "all" || item.account.industry === industry) && (signalType === "all" || item.account.signal.type === signalType) && (!warmOnly || Boolean(verifiedWarmBuyer(item.account.buyers))) && (targetTier === "all" || String(context?.tier) === targetTier) && (targetVertical === "all" || context?.vertical === targetVertical) && (targetRelationship === "all" || context?.relationshipStatus === targetRelationship);
+    });
     return [...list].sort((a, b) => sort === "company" ? a.account.name.localeCompare(b.account.name) : b.score.total - a.score.total);
-  }, [details, industry, signalType, warmOnly, sort]);
+  }, [details, industry, signalType, warmOnly, sort, membershipById, targetTier, targetVertical, targetRelationship]);
+
+  function updateWorkspace(payload: WorkspaceUpdate) {
+    if (payload.details) setDetails(payload.details);
+    if (payload.metrics) setWorkspaceMetrics(payload.metrics);
+    if (payload.status) setStatus(payload.status);
+  }
 
   function selectAccount(id: string) { setSelectedId(id); setStage("prioritize"); setMobileDetail(true); setTone(drafts[id]?.tone ?? "Direct"); }
 
   async function refreshSignals(accountId?: string) {
     setRefreshing(true);
     try {
-      const response = await fetch("/api/signals/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ accountId }) });
+      const response = await fetch("/api/signals/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ accountId, ...(targetList ? { listId: targetList.id } : {}) }) });
       const payload = await response.json();
       if (payload.details) setDetails(payload.details);
       if (payload.status) setStatus(payload.status);
@@ -139,10 +162,11 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
   function advance() { setStage(stage === "prioritize" ? "pursuit" : "outreach"); window.scrollTo({ top: 0, behavior: "smooth" }); }
   function onTabKeyDown(event: React.KeyboardEvent<HTMLButtonElement>, index: number) { if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return; event.preventDefault(); const next = (index + (event.key === "ArrowRight" ? 1 : -1) + stages.length) % stages.length; setStage(stages[next].id); tabRefs.current[next]?.focus(); }
 
-  if (!selected) return <main className="empty-state">No accounts are available.</main>;
+  if (!selected) return <main className="empty-state"><p>No accounts are available.</p><Link href="/lists">Manage target lists</Link></main>;
+  const targetContext = membershipById.get(selected.account.id);
   const warm = verifiedWarmBuyer(selected.account.buyers);
   const liveMode = status.zoomInfo?.state !== "mock" && status.diagnostics.some((item) => item.provider === "ZoomInfo" && item.mode === "live");
-  const pendingResearch = liveMode && selected.account.signal.source.provenance !== "verified";
+  const pendingResearch = (liveMode || Boolean(targetList)) && selected.account.signal.source.provenance !== "verified";
   const visibleBuyers = selected.account.buyers.filter((buyer) => buyer.source.provenance === "verified" || buyer.relationshipProvenance === "verified");
   const canDraft = hasCurrentSignal(selected.account);
   const recommendation = selected.recommendation;
@@ -162,19 +186,23 @@ export function Dashboard({ initialDetails, initialStatus, metrics, initialAccou
     </header>
     <div className="workspace">
       <aside className={`queue-panel ${mobileDetail ? "mobile-hidden" : ""}`} aria-label="Account queue">
+        {targetList && <div className="list-workspace-heading"><Link href="/lists">← All target lists</Link><h2>{targetList.name}</h2></div>}
         <div className="queue-header"><div className="eyebrow">Signal queue</div><div className="queue-title-row"><h2>Who to call today</h2><span>{workspaceMetrics.canonicalAccounts} companies · {workspaceMetrics.rows} rows</span></div>
-          <button className="refresh-button" onClick={() => refreshSignals()} disabled={refreshing || Boolean(zoomInfoNeedsConnection)}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : zoomInfoNeedsConnection ? "Connect ZoomInfo to refresh" : "Refresh signals"}</button>
+          {targetList ? <ListEnrichment listId={targetList.id} ready={status.zoomInfo?.state === "ready"} details={details} onUpdate={updateWorkspace} onBusy={setRefreshing} /> : <button className="refresh-button" onClick={() => refreshSignals()} disabled={refreshing || Boolean(zoomInfoNeedsConnection)}>{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{refreshing ? "Refreshing signals..." : zoomInfoNeedsConnection ? "Connect ZoomInfo to refresh" : "Refresh signals"}</button>}
           <div className="filters"><select aria-label="Sort account queue" value={sort} onChange={(e) => setSort(e.target.value)}><option value="score">Highest score</option><option value="company">Company A-Z</option></select><select aria-label="Filter by industry" value={industry} onChange={(e) => setIndustry(e.target.value)}><option value="all">All industries</option>{industries.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by signal type" value={signalType} onChange={(e) => setSignalType(e.target.value)}><option value="all">All signals</option>{signalTypes.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filter by relationship" value={warmOnly ? "warm" : "all"} onChange={(e) => setWarmOnly(e.target.value === "warm")}><option value="all">All relationships</option><option value="warm">Warm only</option></select></div>
           <p className="refresh-note">Ranked by explainable ICP fit. Unknown evidence earns zero points.</p>
+          {targetList && <div className="filters"><select aria-label="Filter by target tier" value={targetTier} onChange={(event) => setTargetTier(event.target.value)}><option value="all">All target tiers</option>{[...new Set(targetList.memberships.flatMap((member) => member.tier ? [member.tier] : []))].sort((a, b) => a - b).map((tier) => <option key={tier} value={tier}>Tier {tier}</option>)}</select><select aria-label="Filter by target vertical" value={targetVertical} onChange={(event) => setTargetVertical(event.target.value)}><option value="all">All target verticals</option>{[...new Set(targetList.memberships.flatMap((member) => member.vertical ? [member.vertical] : []))].sort().map((vertical) => <option key={vertical}>{vertical}</option>)}</select><select aria-label="Filter by imported relationship" value={targetRelationship} onChange={(event) => setTargetRelationship(event.target.value)}><option value="all">All imported relationships</option>{[...new Set(targetList.memberships.flatMap((member) => member.relationshipStatus ? [member.relationshipStatus] : []))].sort().map((relationship) => <option key={relationship}>{relationship}</option>)}</select></div>}
         </div>
         <div className="queue-list">{filtered.map((item) => { const rowWarm = verifiedWarmBuyer(item.account.buyers); return <button key={item.account.id} className={`account-row ${selected.account.id === item.account.id ? "selected" : ""}`} onClick={() => selectAccount(item.account.id)} aria-current={selected.account.id === item.account.id ? "true" : undefined}><div className="account-row-top"><div><div className="account-name">{item.account.name}</div><div className="account-industry">{item.account.industry} · {item.account.revenueRange}</div></div><div className={`score-number ${item.score.total >= 80 ? "high" : ""}`}>{item.score.total}</div></div><div className="account-signal"><SignalIcon size={13} /><span>{liveMode && item.account.signal.source.provenance !== "verified" ? "Signal research pending" : `${item.account.signal.type} / ${item.account.signal.date}`}</span></div><div className="account-meta">{rowWarm ? <span className="badge warm">Warm via {rowWarm.relationshipSource.split(":")[0]}</span> : <span className="badge">Relationship unverified</span>}{item.account.duplicateOf && <span className="badge warning">Possible duplicate</span>}<ChevronRight size={13} style={{ marginLeft: "auto" }} /></div></button>; })}</div>
       </aside>
       <main className={`detail-panel ${mobileDetail ? "mobile-active" : ""}`}>
+        {targetList && <Link href="/lists" className="list-return-link">Manage target lists</Link>}
         <button className="back-button" onClick={() => setMobileDetail(false)}><ArrowLeft size={15} />Back to queue</button>
         <div className="detail-header"><div className="account-heading"><div className="eyebrow">Decision-ready pursuit</div><h2>{selected.account.name}</h2><p>{selected.account.industry} / {selected.account.revenueRange} / {pendingResearch ? "Signal research pending" : `Signal ${selected.account.signal.date}`}</p></div><div className="detail-score"><div className="score-ring" style={{ "--score": selected.score.total } as React.CSSProperties}><strong>{selected.score.total}</strong></div><div className="score-label"><strong>{selected.score.category}</strong><span>ICP fit score</span></div></div></div>
         {selected.account.duplicateOf && <div className="callout-warning" style={{ maxWidth: 1200, margin: "14px auto 0" }}><AlertTriangle size={14} style={{ verticalAlign: "middle", marginRight: 7 }} /><strong>Possible duplicate:</strong> this row shares canonical company ID <code>{selected.account.canonicalCompanyId}</code>. Signal refreshes are deduplicated and metrics count it once.</div>}
         <div className="stage-tabs" role="tablist" aria-label="Pursuit workflow">{stages.map((item, index) => <button key={item.id} ref={(node) => { tabRefs.current[index] = node; }} id={`tab-${item.id}`} className="stage-tab" role="tab" aria-selected={stage === item.id} aria-controls={`panel-${item.id}`} tabIndex={stage === item.id ? 0 : -1} onClick={() => setStage(item.id)} onKeyDown={(event) => onTabKeyDown(event, index)}><span>{index + 1}</span>{item.label}</button>)}</div>
         <section className="content-area" role="tabpanel" id={`panel-${stage}`} aria-labelledby={`tab-${stage}`}>
+          {targetContext && <article className="card target-context"><h3>Imported context — unverified</h3><dl><div><dt>Target account</dt><dd>{targetContext.accountName}</dd></div>{targetContext.vertical && <div><dt>Vertical</dt><dd>{targetContext.vertical}</dd></div>}{targetContext.tier && <div><dt>Tier</dt><dd>{targetContext.tier}</dd></div>}{targetContext.relationshipStatus && <div><dt>Relationship</dt><dd>{targetContext.relationshipStatus}</dd></div>}{targetContext.suggestedEntryOffer && <div><dt>Suggested entry offer</dt><dd>{targetContext.suggestedEntryOffer}</dd></div>}</dl><p>Planning context from {targetContext.filename}. Imported {new Date(targetContext.importedAt).toLocaleDateString()}. This context does not change the ICP score or evidence-based recommendations.</p></article>}
           {stage === "prioritize" && <><div className="grid-two"><article className="card"><div className="card-header"><div><div className="eyebrow">Why now</div><h3>{pendingResearch ? "Signal research pending" : selected.account.signal.type}</h3></div>{pendingResearch ? <span className="badge">Not researched</span> : provenanceBadge(selected.account.signal.source.provenance)}</div><div className="signal-callout"><strong>{pendingResearch ? "Refresh this account to check for current ZoomInfo signals." : selected.account.signal.summary}</strong><p>{pendingResearch ? "No live trigger has been established for this account." : selected.account.signal.whyNow}</p></div><p>This is a buying-trigger hypothesis, not proof of budget. Confirm the initiative, executive sponsor, timing, and business outcome before advancing.</p>
             {Boolean(evidence.intentTopics.length) && <><h3 style={{ marginTop: 18 }}>Intent topics observed</h3><div className="tag-row">{evidence.intentTopics.map((item) => <span className="tag" key={`${item.topic}-${item.date}`}>{item.topic} · score {item.score} · {item.date}</span>)}</div></>}
             {Boolean(evidence.scoops.length) && <><h3 style={{ marginTop: 18 }}>Recent company events</h3><ul className="evidence-list">{evidence.scoops.map((item, index) => <li key={`${index}-${item.type}-${item.date}`}><strong>{item.type}</strong> · {item.date} — {item.summary}{item.url && <> <a href={item.url} target="_blank" rel="noreferrer">source <ExternalLink size={10} /></a></>}</li>)}</ul></>}

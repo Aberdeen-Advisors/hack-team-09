@@ -2,7 +2,28 @@
 
 Signal-to-Outreach is a mock-first hackathon MVP for Aberdeen Advisors. It turns a buying signal into a ranked pursuit, explainable ICP score, likely buyer map, TEAM/4E offering recommendation, editable outreach email, and Slack alert preview.
 
-## Architecture
+## Target lists
+
+Open `/lists` to upload, rename, replace, delete, or open a named target list. Existing workspace accounts migrate once into **Starter Accounts**. Lists share company records and ZoomInfo evidence, while tier, vertical, relationship status, and suggested offer belong to each list membership.
+
+Download the template from the upload dialog or `/target-list-template.csv`:
+
+```csv
+account_name,website,zoominfo_company_id,vertical,tier,relationship_status,suggested_entry_offer
+Example Health,https://examplehealth.com,,Healthcare,1,Existing relationship,AI strategy and readiness
+```
+
+`account_name` and `website` are required. Use the official domain (for example `examplehealth.com`) or its HTTP(S) URL. URLs normalize to HTTPS hostnames, without `www`, paths, query parameters, or fragments. The optional ZoomInfo ID must be a positive safe integer and agree with the exact website match. Tier is a positive integer; other optional fields are plain text.
+
+Uploads support UTF-8 CSV and the first worksheet of XLSX, up to 4 MB and 500 accounts. Header order is flexible; whitespace and header case are normalized. Blank rows are ignored. Unknown/duplicate headers, duplicate companies, identifier conflicts, malformed websites, formulas, and non-scalar Excel cells must be corrected before import. No external company lookup runs during preview or import. The server revalidates rows when saving.
+
+Replacing a list treats the file as its complete membership set. Removing memberships or deleting a list retains shared company evidence. Companies with no remaining list memberships are hidden from normal views and reused if subsequently imported. Concurrent list updates use revision checks and a shared account-write lock; memory and Redis implementations save accounts and memberships atomically. Imported context is visibly unverified and does not affect scores, recommendations, or model inputs.
+
+Open a list and click **Enrich pending accounts** after connecting live ZoomInfo. The browser requests sequential batches of at most five canonical companies. Results and failures persist after each batch; keep the page open for continued processing. **Pause** finishes the active batch. Reopening the list and clicking enrichment resumes pending/failed accounts and skips companies already enriched in another list. **Refresh all** explicitly confirms a fresh lookup of every company. **Retry failures** retries unresolved accounts. Failures remain visible per account. Demo mode accepts uploads but cannot claim live enrichment.
+
+New routes: `/api/target-lists` (list/create), `/api/target-lists/import/preview` (multipart upload), `/api/target-lists/[id]` (get/replace/rename/delete), and `/api/target-lists/[id]/accounts` (scoped workspace). The existing refresh endpoint accepts `{ listId, accountIds, force? }` and retains `{ accountId }` compatibility. All new mutations require the existing same-origin administrator boundary. No additional credentials are required.
+
+## Application architecture
 
 - Next.js 16 App Router, React, TypeScript, Tailwind CSS, Zod, Vitest, Playwright, and axe-core
 - Typed seed data with an Upstash Redis production snapshot and a single shared administrator session

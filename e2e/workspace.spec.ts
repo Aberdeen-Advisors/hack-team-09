@@ -9,16 +9,18 @@ test("laptop journey carries ZoomInfo evidence through all three stages", async 
   page.on("pageerror", (error) => errors.push(error.message));
   const details = listAccountDetails([liveAccount()]);
   const status = { demoMode: false, diagnostics: [{ provider: "ZoomInfo", mode: "live", status: "ready", configured: true, message: "Fixture connection", checkedAt: "2026-09-08" }, { provider: "OpenAI", mode: "mock", status: "ready", configured: false, message: "Templates", checkedAt: "2026-09-08" }], zoomInfo: { state: "ready", requiredToolsReady: true, liveAccounts: 1, totalCanonicalAccounts: 1 } };
+  await page.route("**/api/integrations/status", (route) => route.fulfill({ json: status }));
+  await page.route("**/api/target-lists/starter/accounts", (route) => route.fulfill({ json: { details: listAccountDetails().filter((item) => item.account.id === "draftkings") } }));
   await page.route("**/api/signals/refresh", (route) => route.fulfill({ json: { details, status, featuredAccountId: "draftkings", metrics: { rows: 1, canonicalAccounts: 1, pursueNow: 0 }, refresh: { updated: 1, cached: 0, failed: [], estimatedCompanyCredits: 0 } } }));
   await page.route("**/api/accounts/draftkings/draft-outreach", (route) => route.fulfill({ json: { draft: details[0].outreach, fallback: false } }));
-  await page.goto("/");
+  await page.goto("/lists/starter");
 
   await expect(page.getByRole("heading", { name: "Who to call today" })).toBeVisible();
   await expect(page.getByRole("tab", { name: /Prioritize/ })).toHaveAttribute("aria-selected", "true");
   await page.getByRole("button", { name: "Open ZoomInfo setup" }).click();
   await page.getByRole("button", { name: "Close diagnostics" }).click();
-  await page.getByRole("button", { name: "Refresh signals" }).click();
-  await expect(page.getByRole("status")).toContainText("accounts refreshed");
+  await page.getByRole("button", { name: "Enrich pending accounts" }).click();
+  await expect(page.getByRole("status")).toContainText("Finished:");
   await page.getByRole("button", { name: /Map buyer and offering/ }).click();
   await expect(page.getByRole("tab", { name: /Pursuit/ })).toHaveAttribute("aria-selected", "true");
   await page.getByRole("button", { name: /Draft outreach/ }).click();
@@ -40,7 +42,7 @@ test("laptop journey carries ZoomInfo evidence through all three stages", async 
 
 test("narrow layout moves from queue to focused detail without overflow", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await page.goto("/lists/starter");
 
   await expect(page.getByRole("heading", { name: "Who to call today" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);

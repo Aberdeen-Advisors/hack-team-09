@@ -629,6 +629,7 @@ async function resolveCompany(client: Client, account: Account): Promise<{ compa
   }
   const companyId = stringValue(matches[0], ["companyId", "zoominfoCompanyId", "ziCompanyId", "id"]);
   if (!companyId) throw new Error(`ZoomInfo company match for ${account.name} did not include a company ID`);
+  if (account.providerIds?.zoominfoCompanyId && account.providerIds.zoominfoCompanyId !== companyId) throw new Error(`ZoomInfo company ID conflicts with the exact website match for ${account.name}. Correct the account identifiers before retrying.`);
   return { companyId, record: matches[0] };
 }
 
@@ -932,9 +933,18 @@ async function refreshOneAccount(client: Client, account: Account, topics: strin
   return { canonicalCompanyId: account.canonicalCompanyId, zoominfoCompanyId: company.companyId, signal, buyers, profile: buildCompanyProfile(company.record), buyersFailed: buyersResult.status === "rejected", warnings };
 }
 
-export function refreshCandidates(items: Account[], accountId?: string): Account[] {
+export function refreshCandidates(items: Account[], accountId?: string, accountIds?: string[]): Account[] {
   const representatives = new Map<string, Account>();
   for (const account of items) if (!representatives.has(account.canonicalCompanyId) || !account.duplicateOf) representatives.set(account.canonicalCompanyId, account);
+  if (accountIds) {
+    if (!accountIds.length || accountIds.length > 5) throw new Error("Select between one and five accounts per batch");
+    const canonicalIds = new Set(accountIds.map((id) => {
+      const account = items.find((item) => item.id === id);
+      if (!account) throw new Error("Account not found");
+      return account.canonicalCompanyId;
+    }));
+    return [...canonicalIds].map((id) => representatives.get(id)!);
+  }
   if (accountId) {
     const target = items.find((item) => item.id === accountId);
     if (!target) throw new Error("Account not found");
@@ -969,7 +979,7 @@ export class ZoomInfoRefreshInProgressError extends Error {
   constructor() { super("A ZoomInfo refresh is already running"); }
 }
 
-export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ accounts: Account[]; summary: ZoomInfoRefreshSummary }> {
+export async function refreshZoomInfoAccounts(accountId?: string, options?: { accountIds: string[]; listId?: string; force?: boolean }): Promise<{ accounts: Account[]; summary: ZoomInfoRefreshSummary }> {
   const snapshot = await zoomInfoIntegrationSnapshot(true);
   if (zoomInfoMode() !== "mcp") throw new Error("ZoomInfo MCP mode is not enabled");
   if (snapshot.state !== "ready") throw new Error(snapshot.error || "Connect ZoomInfo before refreshing live signals");
@@ -983,7 +993,15 @@ export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ acc
     await discoverRequiredTools(client);
     const { topics, note: intentNote } = await resolveIntentTopics(client);
     const currentAccounts = await loadAccounts();
-    const candidates = refreshCandidates(currentAccounts, accountId);
+    const lists = await persistence.loadTargetLists();
+    if (options?.listId) {
+      const list = lists?.find((item) => item.id === options.listId);
+      if (!list || options.accountIds.some((id) => !list.memberships.some((member) => member.accountId === id))) throw new Error("List membership changed. Reload the list before enriching.");
+    }
+    const visibleIds = lists ? new Set(lists.flatMap((list) => list.memberships.map((m) => m.accountId))) : undefined;
+    const eligible = accountId || options ? currentAccounts : currentAccounts.filter((account) => !visibleIds || visibleIds.has(account.id));
+    const candidates = refreshCandidates(eligible, accountId, options?.accountIds).filter((account) => !options || options.force || account.signal.source.provenance !== "verified" || account.enrichment?.error);
+    if (!candidates.length) return { accounts: currentAccounts, summary: { selected: 0, updated: 0, cached: 0, unchanged: currentAccounts.length, failed: [], estimatedCompanyCredits: 0 } };
     const ttlMs = Number(process.env.ZOOMINFO_CACHE_TTL_MINUTES || 1440) * 60_000;
     const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
     const updates: ZoomInfoAccountUpdate[] = [];
@@ -996,7 +1014,7 @@ export async function refreshZoomInfoAccounts(accountId?: string): Promise<{ acc
       const results = await Promise.allSettled(batch.map(async (account) => {
         const key = cacheKey(account, topics);
         const entry = await persistence.getCompanyCache(account.canonicalCompanyId);
-        if (!accountId && entry && entry.expiresAt > Date.now() && entry.key === key) return { update: entry.update, cached: true, expiresAt: entry.expiresAt };
+        if (!accountId && !options?.force && entry && entry.expiresAt > Date.now() && entry.key === key) return { update: entry.update, cached: true, expiresAt: entry.expiresAt };
         const update = await refreshOneAccount(client, accountSchema.parse(account), topics);
         const expiresAt = Date.now() + ttlMs;
         await persistence.saveCompanyCache(account.canonicalCompanyId, { update, expiresAt, key }, ttlSeconds);
